@@ -2,7 +2,11 @@
 //! rskvs is a little key-value storage.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
+use failure::{Error};
+
+type Result<T> = std::result::Result<T, Error>;
 
 /// A KvStoree offers method get/set/remove methods like HashMap.
 /// Additionally, KvStore provides stablizability.
@@ -27,8 +31,9 @@ impl KvStore{
     /// kvs.set("abc".to_string(), "def".to_string());
     /// 
     /// ```
-    pub fn set(&mut self, key:String, value:String){
+    pub fn set(&mut self, key:String, value:String) -> Result<()>{
         let _ = self.sto.insert(key, value);
+        Ok(())
     }
 
     /// Get value for a given key, which is  wrapped in Option.
@@ -38,13 +43,13 @@ impl KvStore{
     /// 
     /// let mut kvs = KvStore::new();
     /// kvs.set("abc".to_string(), "def".to_string());
-    /// assert_eq!("def".to_string(), kvs.get("abc".to_string()).unwrap());
+    /// assert_eq!("def".to_string(), kvs.get("abc".to_string()).unwrap().unwrap());
     /// 
     /// ```
-    pub fn get(&mut self, key:String) -> Option<String>{
+    pub fn get(&mut self, key:String) -> Result<Option<String>>{
         match self.sto.get(&key){
-            None => None,
-            Some(st) => Some(st.to_string()),
+            None => Ok(None),
+            Some(st) => Ok(Some(st.to_string())),
         }
     }
 
@@ -59,8 +64,14 @@ impl KvStore{
     /// kvs.remove("abc".to_string());
     /// kvs.remove("abc".to_string()); // double removement, ok
     /// ```
-    pub fn remove(&mut self, key:String){
+    pub fn remove(&mut self, key:String) -> Result<()>{
         let _ = self.sto.remove(&key);
+        Ok(())
+    }
+
+    /// Open the KvStore at a given path. Return the KvStore.
+    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore>{
+        Ok(KvStore::new())
     }
 }
 

@@ -6,15 +6,19 @@ use std::io::{Read, Write, BufWriter, BufReader, SeekFrom, Seek};
 use std::collections::HashMap;
 use std::path::PathBuf;
 // use std::sync::{Arc, Mutex};
-use std::cell::RefCell;
+
+use std::default::Default;
 
 
 use failure::{Error};
 use serde::{Serialize, Deserialize};
 
-type Result<T> = std::result::Result<T, Error>;
-type Key = String;
-type Value = String;
+/// Result type.
+pub type Result<T> = std::result::Result<T, Error>;
+/// Key type.
+pub type Key = String;
+/// Value type.
+pub type Value = String;
 
 /// A KvStoree offers method get/set/remove methods like HashMap.
 /// Additionally, KvStore provides stablizability.
@@ -44,7 +48,6 @@ impl KvStore{
     pub fn set(&mut self, key:Key, value:Value) -> Result<()>{
         let (fid, offset, sz) = self.st
             .stablize(key.clone(), value, StableEntryState::Valid)?;
-            
         self.kd.update(&key, fid, offset, sz)?;
         Ok(())
     }
@@ -93,9 +96,26 @@ impl KvStore{
     }
 
     /// Open the KvStore at a given path. Return the KvStore.
-    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore>{
-        Ok(KvStore::new())
+    pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore>{
+        let mut kvs = KvStore::new();
+        let mut p = dir_path.into();
+        p.push(0.to_string());
+        kvs.set_path(p);
+        Ok(kvs)
     }
+
+    /// Rebuild KeyDir from data file or hint file.
+    pub fn rebuild(&mut self) -> Result<()>{
+        let hmap = self.st.rebuild_from_all()?;
+        self.kd = hmap;
+        Ok(())
+    }
+
+    fn set_path(&mut self, path: impl Into<PathBuf>){
+        // check
+        self.st.path = path.into();
+    }
+    
 }
 
 #[derive(Debug, Clone)]
@@ -108,20 +128,30 @@ struct MemDirEntry{
     // timestamp.
 }
 
+impl Default for MemDirEntry{
+    fn default() -> Self{
+        MemDirEntry{
+            fid: 0,
+            offset: 0,
+            sz: 0,
+        }
+    }
+}
+
 struct KeyDir{
-    map: RefCell<HashMap<Key, MemDirEntry>>,
+    map: HashMap<Key, MemDirEntry>,
 }
 
 impl KeyDir{
     fn new() -> KeyDir{
         KeyDir{
-            map: RefCell::new(HashMap::new()),
+            map: HashMap::new(),
         }
     }
 
     /// Get Key directory entry.
     fn get(&self, k: &Key) -> Option<MemDirEntry>{
-        match self.map.borrow().get(k){
+        match self.map.get(k){
             None => None,
             Some(r) => Some(r.clone()),
         }
@@ -129,25 +159,17 @@ impl KeyDir{
 
     /// Update diretory entry.
     fn update(&mut self, k: &Key, fid: u32, offset: u32, sz: u32) -> Result<()>{
-        let me = MemDirEntry{
-            fid: fid,
-            offset: offset,
-            sz: sz,
-        };
-        let e = self.map.get_mut().get_mut(k).unwrap();
-        *e = me;
+        let e = self.map.entry(k.clone()).or_insert(MemDirEntry::default());
+        e.fid = fid;
+        e.offset = offset;
+        e.sz = sz;
         Ok(())
     }
 
     fn remove(&mut self, k: &Key){
-        let _ = self.map.borrow_mut().remove(k);
+        let _ = self.map.remove(k);
     }
 
-    /*
-    fn rebuild_key_dir(&mut self){
-        unimplemented!()
-    }
-    */
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,19 +189,27 @@ enum StableEntryState{
     Deleted, 
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+struct FID{
+    fid: u32,
+}
+
+//const SUFFIX_HINT:&str = "hint";
+const EXTENSION_DATA:&str = "data";
+const PATH_FID_LIST:&str = "fids";
+
 struct StableStorage{
     // id of the active file .
     fid: u32, 
     // file size threshold. 
     // When a active file reach this value, it will be closed and become immutable.
     fsz_th: u32,
-
     // TODO: use efficient obj.
-    active_f: Option<RefCell<BufWriter<File>>>,
-
+    active_f: Option<BufWriter<File>>,
     // = len(file), Bytes.
     total_bs: u32, 
-
+    // path.
+    path: PathBuf,
 }
 
 impl StableStorage{
@@ -189,6 +219,7 @@ impl StableStorage{
             fsz_th: 4096,
             active_f: None, 
             total_bs: 0,
+            path: PathBuf::new(),
         }
     }
 
@@ -226,7 +257,6 @@ impl StableStorage{
         {
             self.create_new_active_file()?;
         }
-
         let f = self.active_f.as_mut().unwrap().get_mut();
         let size = f.write(serde_json::to_string(&se)?.as_bytes())? as u32;
         self.total_bs += size;
@@ -239,23 +269,114 @@ impl StableStorage{
     }
 
     #[inline]
-    fn active_file_path(&self) -> String{
-        format!("miao_{}", self.fid)
+    fn active_file_path(&self) -> PathBuf{
+        eprintln!("{:?}", self.path);
+        self.path.to_path_buf()
     }
 
     #[inline]
-    fn get_file_path(&self, fid: u32) -> String{
-        format!("miao_{}", fid)
+    fn get_file_path(&self, fid: u32) -> PathBuf{
+        let mut pp = self.path.parent().unwrap().to_path_buf();
+        pp.push(StableStorage::data_file_name(fid));
+        pp.set_extension(EXTENSION_DATA);
+        pp
+    }
+
+    #[inline]
+    fn data_file_name(fid: u32) -> String{
+        fid.to_string()
     }
 
     fn create_new_active_file(&mut self) -> Result<()>{
+        eprintln!("P");
         self.fid += 1;
-        let f = std::fs::OpenOptions::new()
+
+        self.path.pop();
+        self.path.push(PATH_FID_LIST);
+        // TODO:
+        std::fs::OpenOptions::new()
+            .create(true)
             .append(true)
-            .open(self.active_file_path())?; 
+            .open(&self.path)?
+            .write(serde_json::to_string(&FID{fid: self.fid})?.as_bytes())?;
+
+        self.path.pop();
+        self.path.push(StableStorage::data_file_name(self.fid));
+
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+
         let nf = BufWriter::new(f);
-        self.active_f = Some(RefCell::new(nf));
+        self.active_f = Some(nf);
+        eprintln!("V");
+
         Ok(())
     }
 
+    /// Rebuild KeyDir before KVStorage is available for user.
+    fn rebuild_from_all(&mut self) -> Result<KeyDir>{
+        let mut kd = KeyDir::new();
+        let dir_path = self.path.parent().unwrap().to_path_buf();
+        assert_eq!(true, dir_path.is_dir());
+        // make sure loading in order.
+        let mut fid_path = dir_path.to_path_buf();
+        fid_path.push(PATH_FID_LIST);
+
+        eprintln!("fids: {:?}", &fid_path);
+
+        // TODO: read fids from PATH_FID_LIST
+        let mut bf = String::new();
+        std::fs::OpenOptions::new()
+            //.create(true)
+            .read(true)
+            .open(fid_path)?
+            .read_to_string(&mut bf)?;
+
+        match serde_json::from_str::<Vec<FID>>(&bf){
+            Ok(v) => {
+                for e in v{
+                    eprintln!("--{:?}", e);
+                }
+            },
+            Err(e) => {
+                eprintln!("rebuild all: {}", e);
+            }
+        }
+        Ok(kd)
+    }
+
+    /// Rebuild signle data file.
+    fn rebuild_from_single(kd:&mut KeyDir, p:&PathBuf, fid: u32) -> Result<usize>{
+        eprintln!("--");
+
+        let mut total_bs = 0usize;
+        let mut bf = Vec::new();
+        if let Ok(mut f) = File::open(p){
+            let sz = f.read_to_end(&mut bf)?;
+            /*
+            for v in vc{
+                match v.state{
+                    StableEntryState::Deleted => {
+                        kd.map.remove(&v.key).unwrap();
+                    },
+                    StableEntryState::Valid => {
+                        let sz = serde_json::to_string(&v)?.as_bytes().len();
+                        kd.map.insert(v.key, MemDirEntry{
+                            fid: fid,
+                            offset: total_bs as u32,
+                            sz: sz as u32,
+                        });
+                    },
+                }
+            }*/
+            total_bs += sz;
+            eprintln!("load {:?}, totol size: {} Byte", &p, sz);
+        }else{
+            eprintln!("failed to load data {:?}", &p);
+        }
+        Ok(total_bs)
+    }
+    
 }

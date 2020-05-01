@@ -49,13 +49,14 @@ impl KvStore{
     pub fn set(&mut self, key:Key, value:Value) -> Result<()>{
         let (fid, offset, sz) = self.st
             .stablize(key.clone(), value, StableEntryState::Valid)?;
+        eprintln!("set key={}, fid={}, offset={}, size={}", &key, fid, offset, sz);
         self.kd.update(&key, fid, offset, sz)?;
         Ok(())
     }
 
     /// Get value for a given key, which is  wrapped in Option.
     /// Note that if KeyDir doesn't contains such key, KVStorage won't lookup StableStorage.
-    /// # Example
+    /// # Example1
     /// ```
     /// use rskvs::KvStore;
     /// 
@@ -114,13 +115,13 @@ impl KvStore{
 
     /// print state after rebuilding.
     pub fn init_state(&self){
-        eprintln!("------------- KVS state ------------");
-        eprintln!("StableStorage status: {}, {}, path={:?}", self.st.total_bs, self.st.fid, &self.st.path);
-        eprintln!("-------------------------------");
+        eprintln!("--------------------- KVS state --------------------");
+        eprintln!("StableStorage status: total_bs:{}\nfid={}\npath={:?}", self.st.total_bs, self.st.fid, &self.st.path);
+        eprintln!("----------------------------------------------------");
         for (k, v) in &self.kd.map{
-            eprintln!("{}-{:?}", k, v);
+            eprintln!("key={:12} val={:?}", k, v);
         }
-        eprintln!("------------------------------------");
+        eprintln!("----------------------------------------------------");
     }
 
     fn set_path(&mut self, path: impl Into<PathBuf>){
@@ -228,7 +229,7 @@ impl StableStorage{
     fn new() -> StableStorage{
         StableStorage{
             fid: 0,
-            fsz_th: 4096,
+            fsz_th: 512,
             active_f: None, 
             total_bs: 0,
             path: PathBuf::new(),
@@ -240,7 +241,7 @@ impl StableStorage{
     fn load(&mut self, fid: u32, offset: u32, sz: u32) -> Result<StableEntry>{
         // open file fid 
         // seek to offset
-        if self.active_f.is_none(){
+        if self.active_f.is_none() || self.reach_threshold(){
             self.create_new_active_file()?;
         }
 
@@ -277,9 +278,7 @@ impl StableStorage{
             val: v,
         };
 
-        if self.active_f.is_none() || 
-            self.reach_threshold()
-        {
+        if self.active_f.is_none() || self.reach_threshold(){
             self.create_new_active_file()?;
         }
         
@@ -300,12 +299,6 @@ impl StableStorage{
     }
 
     #[inline]
-    fn active_file_path(&self) -> PathBuf{
-        eprintln!("{:?}", self.path);
-        self.path.to_path_buf()
-    }
-
-    #[inline]
     fn get_file_path(&self, fid: u32) -> PathBuf{
         let mut pp = self.path.parent().unwrap().to_path_buf();
         pp.push(StableStorage::data_file_name(fid));
@@ -318,7 +311,7 @@ impl StableStorage{
     }
 
     fn update_fid_list(&mut self) -> Result<()>{
-        // | st: u32 | end: u32 |  -->  [st, end]
+        // | st: u32 | end: u32 |  -->  [st, end)
         self.path.push(PATH_FID_LIST);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -327,20 +320,18 @@ impl StableStorage{
             .open(&self.path)?;
         
         if let Err(_) = f.read_u32::<NativeEndian>(){
-            f.write_u32::<NativeEndian>(self.fid)?;
-            f.write_u32::<NativeEndian>(self.fid)?;
+            f.write_u32::<NativeEndian>(1)?;
+            f.write_u32::<NativeEndian>(1)?;
         }else{ 
             f.seek(SeekFrom::Start(4)).unwrap(); 
-            f.write_u32::<NativeEndian>(self.fid)?;
+            f.write_u32::<NativeEndian>(self.fid + 1)?;
         }
         self.path.pop();
         Ok(())
     }
 
     fn create_new_active_file(&mut self) -> Result<()>{
-        eprintln!("P");
         self.fid += 1;
-        self.total_bs = 0;
 
         self.path.pop();
         self.update_fid_list()?;
@@ -351,15 +342,17 @@ impl StableStorage{
             .append(true)
             .open(&self.path)?;
 
+        self.total_bs = f.metadata().unwrap().len() as u32;
+
         let nf = BufWriter::new(f);
         self.active_f = Some(nf);
-        eprintln!("V");
-
         Ok(())
     }
 
     /// Rebuild KeyDir before KVStorage is available for user.
     fn rebuild_from_all(&mut self) -> Result<KeyDir>{
+
+        self.fid = 0;
         let mut kd = KeyDir::new();
         let mut dir_path = self.path.parent().unwrap().to_path_buf();
         assert_eq!(true, dir_path.is_dir());
@@ -382,7 +375,6 @@ impl StableStorage{
             .open(fid_path)?);
 
         let mut fids = Vec::new();
-        let mut last_fid = 0u32;
         match bf.read_u32::<NativeEndian>(){
             Err(e) => {
                 eprintln!("err: {}", e);
@@ -390,39 +382,38 @@ impl StableStorage{
             Ok(st) => {
                 bf.seek(SeekFrom::Start(4)).unwrap();
                 let end = bf.read_u32::<NativeEndian>().unwrap();
-                fids = (st..=end).collect();
-                last_fid = end;
+                fids = (st..end).collect();
             },
         }
         eprintln!("{:?}", &fids);
 
         // read all data files.
         for fid in fids{
-            
             self.fid = fid;
             dir_path.push(StableStorage::data_file_name(fid));
             self.total_bs = StableStorage::rebuild_from_single(&mut kd, &dir_path, fid)?;
             dir_path.pop();
         }
+
         self.path = dir_path;
-        self.path.push(StableStorage::data_file_name(last_fid));
-        self.active_f = Some(
-            BufWriter::new(
-                std::fs::OpenOptions::new().append(true).create(true).open(&self.path)?
-            )
-        );
+        self.path.push(StableStorage::data_file_name(0));
+        if self.fid > 0{
+            if !self.reach_threshold(){
+                self.fid -= 1
+            }
+            self.create_new_active_file()?;
+
+        }
 
         Ok(kd)
     }
 
     /// Rebuild signle data file.
     fn rebuild_from_single(kd:&mut KeyDir, p:&PathBuf, fid: u32) -> Result<u32>{
-        eprintln!("-- {:?}", p);
-
+        eprintln!("rebuilding from {:?}", p);
         let mut total_bs = 0u32;
         let mut f = BufReader::new(File::open(p)?);
         while let Ok(obj_sz) = f.read_u32::<NativeEndian>(){
-            eprintln!("sz: {}", obj_sz);
             let mut tmp = vec![0;obj_sz as usize];
             f.read_exact(&mut tmp).unwrap();  // read or write will change seek ptr.
 

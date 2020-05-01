@@ -87,14 +87,12 @@ impl KvStore{
     /// kvs.remove("abc".to_string()); // double removement, ok
     /// ```
     pub fn remove(&mut self, key: Key) -> Result<()>{
-        match self.kd.get(&key){
-            None => Ok(()),
-            Some(ref mut me) => {
-                self.st.stablize(key.clone(), String::default(), StableEntryState::Deleted)?;
-                self.kd.remove(&key);
-                Ok(())
-            },
+        if !self.kd.map.contains_key(&key){
+            return Ok(());
         }
+        self.st.stablize(key.clone(), String::default(), StableEntryState::Deleted)?;
+        self.kd.remove(&key);
+        Ok(())
     }
 
     /// Open the KvStore at a given path. Return the KvStore.
@@ -115,13 +113,13 @@ impl KvStore{
 
     /// print state after rebuilding.
     pub fn init_state(&self){
-        eprintln!("--------------------- KVS state --------------------");
-        eprintln!("StableStorage status: total_bs:{}\nfid={}\npath={:?}", self.st.total_bs, self.st.fid, &self.st.path);
-        eprintln!("----------------------------------------------------");
+        eprintln!("========================== KVS state =========================");
+        eprintln!("StableStorage status:\ntotal_bs:{}\nfid={}\npath={:?}", self.st.total_bs, self.st.fid, &self.st.path);
+        eprintln!("========================== Key Dir ===========================");
         for (k, v) in &self.kd.map{
-            eprintln!("key={:12} val={:?}", k, v);
+            eprintln!("key = {:12} val = {:?}", k, v);
         }
-        eprintln!("----------------------------------------------------");
+        eprintln!("======================== Init done ===========================");
     }
 
     fn set_path(&mut self, path: impl Into<PathBuf>){
@@ -366,7 +364,7 @@ impl StableStorage{
             self.update_fid_list().unwrap();
         }
 
-        eprintln!("fids: {:?}", &fid_path);
+        //eprintln!("fids: {:?}", &fid_path);
 
         // read fids from PATH_FID_LIST
         let mut bf = BufReader::new(
@@ -385,7 +383,7 @@ impl StableStorage{
                 fids = (st..end).collect();
             },
         }
-        eprintln!("{:?}", &fids);
+        // eprintln!("{:?}", &fids);
 
         // read all data files.
         for fid in fids{

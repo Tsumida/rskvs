@@ -15,6 +15,8 @@ fn main(){
         eprintln!("{}", e);
         std::process::exit(-1);
     }
+    
+    kvs.init_state();
 
     match matc.subcommand(){
         ("set", Some(sub_set)) => {
@@ -28,13 +30,17 @@ fn main(){
         },
         ("get", Some(sub_get)) => {
             let key = sub_get.value_of("KEY").unwrap_or("");
-            if let Ok(sv) = kvs.get(key.to_string()){
-                match sv{
-                    None => eprintln!("Key not found"),
-                    Some(v) => eprintln!("{}", v),
-                }
-            }else{
-                std::process::exit(-1);
+            match kvs.get(key.to_string()){
+                Ok(sv) => {
+                    match sv{
+                        None => eprintln!("Key not found"),
+                        Some(v) => eprintln!("{}", v),
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(-1);
+                },
             }
         },
         ("rm", Some(sub_rm)) => {

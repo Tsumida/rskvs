@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::default::Default;
 
 
-use failure::{Error};
+use failure::{Error}; 
 use serde::{Serialize, Deserialize};
+use byteorder::{NativeEndian, WriteBytesExt, ReadBytesExt};
 
 /// Result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -111,6 +112,17 @@ impl KvStore{
         Ok(())
     }
 
+    /// print state after rebuilding.
+    pub fn init_state(&self){
+        eprintln!("------------- KVS state ------------");
+        eprintln!("StableStorage status: {}, {}, path={:?}", self.st.total_bs, self.st.fid, &self.st.path);
+        eprintln!("-------------------------------");
+        for (k, v) in &self.kd.map{
+            eprintln!("{}-{:?}", k, v);
+        }
+        eprintln!("------------------------------------");
+    }
+
     fn set_path(&mut self, path: impl Into<PathBuf>){
         // check
         self.st.path = path.into();
@@ -178,7 +190,7 @@ struct StableEntry{
     // timestamp
     // ksz: u32, // key size,
     // vsz: u32, // value size,
-    state: StableEntryState, 
+    st: StableEntryState, 
     key: String,
     val: String,
 }
@@ -204,7 +216,7 @@ struct StableStorage{
     // file size threshold. 
     // When a active file reach this value, it will be closed and become immutable.
     fsz_th: u32,
-    // TODO: use efficient obj.
+
     active_f: Option<BufWriter<File>>,
     // = len(file), Bytes.
     total_bs: u32, 
@@ -232,14 +244,27 @@ impl StableStorage{
             self.create_new_active_file()?;
         }
 
-        let mut bf = BufReader::new(File::open(self.get_file_path(fid))?);
-        let _ = bf.seek(SeekFrom::Start(offset as u64));
-        let mut buf = Vec::with_capacity(sz as usize);
+        eprintln!("attempt load: fid={}, offset={}, sz={}", fid, offset, sz);
 
-        bf.read_exact(&mut buf)?;
-        let se = serde_json::from_slice::<StableEntry>(&buf)?;
+        /* =====================================================================
+        ref: https://github.com/Tsumida/rskvs/issues/2
+            offset
+            |
+            | obj_size: u32 | json_string |
+        =====================================================================*/
+        let fname = self.get_file_path(fid);
+        let mut bf = BufReader::new(File::open(fname)?);
+        let mut buf = vec![0; sz as usize];
+        let _ = bf.seek(SeekFrom::Start(offset as u64))?;
+        
+        let obj_size = bf.read_u32::<NativeEndian>().unwrap();
+        assert_eq!(obj_size, sz);
+        bf.read_exact(&mut buf).unwrap();
 
-        assert_eq!(&StableEntryState::Valid, &se.state);
+        // deserilization.
+        let se = serde_json::from_slice::<StableEntry>(&buf).unwrap();
+
+        assert_eq!(&StableEntryState::Valid, &se.st);
         eprintln!("get {:?}", &se);
         Ok(se)
     }
@@ -247,7 +272,7 @@ impl StableStorage{
     /// Append key-value pair to active file. Return file id, offset and pair size.
     fn stablize(&mut self, k: Key, v: Value, st: StableEntryState) -> Result<(u32, u32, u32)>{
         let se = StableEntry{
-            state: st,
+            st: st,
             key: k,
             val: v,
         };
@@ -257,9 +282,15 @@ impl StableStorage{
         {
             self.create_new_active_file()?;
         }
+        
         let f = self.active_f.as_mut().unwrap().get_mut();
-        let size = f.write(serde_json::to_string(&se)?.as_bytes())? as u32;
+        let s = serde_json::to_string(&se)?;
+        let size = s.as_bytes().len() as u32;
+        let _ = f.write_u32::<NativeEndian>(size)?;
+        self.total_bs += 4;
+        assert_eq!(size, f.write(s.as_bytes())? as u32);
         self.total_bs += size;
+
         Ok((self.fid, self.total_bs - size, size))  // offset and length
     }
 
@@ -278,7 +309,6 @@ impl StableStorage{
     fn get_file_path(&self, fid: u32) -> PathBuf{
         let mut pp = self.path.parent().unwrap().to_path_buf();
         pp.push(StableStorage::data_file_name(fid));
-        pp.set_extension(EXTENSION_DATA);
         pp
     }
 
@@ -287,22 +317,35 @@ impl StableStorage{
         fid.to_string()
     }
 
+    fn update_fid_list(&mut self) -> Result<()>{
+        // | st: u32 | end: u32 |  -->  [st, end]
+        self.path.push(PATH_FID_LIST);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        
+        if let Err(_) = f.read_u32::<NativeEndian>(){
+            f.write_u32::<NativeEndian>(self.fid)?;
+            f.write_u32::<NativeEndian>(self.fid)?;
+        }else{ 
+            f.seek(SeekFrom::Start(4)).unwrap(); 
+            f.write_u32::<NativeEndian>(self.fid)?;
+        }
+        self.path.pop();
+        Ok(())
+    }
+
     fn create_new_active_file(&mut self) -> Result<()>{
         eprintln!("P");
         self.fid += 1;
+        self.total_bs = 0;
 
         self.path.pop();
-        self.path.push(PATH_FID_LIST);
-        // TODO:
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?
-            .write(serde_json::to_string(&FID{fid: self.fid})?.as_bytes())?;
+        self.update_fid_list()?;
 
-        self.path.pop();
         self.path.push(StableStorage::data_file_name(self.fid));
-
         let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -318,65 +361,88 @@ impl StableStorage{
     /// Rebuild KeyDir before KVStorage is available for user.
     fn rebuild_from_all(&mut self) -> Result<KeyDir>{
         let mut kd = KeyDir::new();
-        let dir_path = self.path.parent().unwrap().to_path_buf();
+        let mut dir_path = self.path.parent().unwrap().to_path_buf();
         assert_eq!(true, dir_path.is_dir());
-        // make sure loading in order.
+
+        // check existance of fids.
         let mut fid_path = dir_path.to_path_buf();
         fid_path.push(PATH_FID_LIST);
+        if !fid_path.exists(){
+            self.path = dir_path.clone();
+            assert!(self.path.is_dir());
+            self.update_fid_list().unwrap();
+        }
 
         eprintln!("fids: {:?}", &fid_path);
 
-        // TODO: read fids from PATH_FID_LIST
-        let mut bf = String::new();
-        std::fs::OpenOptions::new()
-            //.create(true)
+        // read fids from PATH_FID_LIST
+        let mut bf = BufReader::new(
+            std::fs::OpenOptions::new()
             .read(true)
-            .open(fid_path)?
-            .read_to_string(&mut bf)?;
+            .open(fid_path)?);
 
-        match serde_json::from_str::<Vec<FID>>(&bf){
-            Ok(v) => {
-                for e in v{
-                    eprintln!("--{:?}", e);
-                }
-            },
+        let mut fids = Vec::new();
+        let mut last_fid = 0u32;
+        match bf.read_u32::<NativeEndian>(){
             Err(e) => {
-                eprintln!("rebuild all: {}", e);
-            }
+                eprintln!("err: {}", e);
+            },
+            Ok(st) => {
+                bf.seek(SeekFrom::Start(4)).unwrap();
+                let end = bf.read_u32::<NativeEndian>().unwrap();
+                fids = (st..=end).collect();
+                last_fid = end;
+            },
         }
+        eprintln!("{:?}", &fids);
+
+        // read all data files.
+        for fid in fids{
+            
+            self.fid = fid;
+            dir_path.push(StableStorage::data_file_name(fid));
+            self.total_bs = StableStorage::rebuild_from_single(&mut kd, &dir_path, fid)?;
+            dir_path.pop();
+        }
+        self.path = dir_path;
+        self.path.push(StableStorage::data_file_name(last_fid));
+        self.active_f = Some(
+            BufWriter::new(
+                std::fs::OpenOptions::new().append(true).create(true).open(&self.path)?
+            )
+        );
+
         Ok(kd)
     }
 
     /// Rebuild signle data file.
-    fn rebuild_from_single(kd:&mut KeyDir, p:&PathBuf, fid: u32) -> Result<usize>{
-        eprintln!("--");
+    fn rebuild_from_single(kd:&mut KeyDir, p:&PathBuf, fid: u32) -> Result<u32>{
+        eprintln!("-- {:?}", p);
 
-        let mut total_bs = 0usize;
-        let mut bf = Vec::new();
-        if let Ok(mut f) = File::open(p){
-            let sz = f.read_to_end(&mut bf)?;
-            /*
-            for v in vc{
-                match v.state{
-                    StableEntryState::Deleted => {
-                        kd.map.remove(&v.key).unwrap();
-                    },
-                    StableEntryState::Valid => {
-                        let sz = serde_json::to_string(&v)?.as_bytes().len();
-                        kd.map.insert(v.key, MemDirEntry{
-                            fid: fid,
-                            offset: total_bs as u32,
-                            sz: sz as u32,
-                        });
-                    },
-                }
-            }*/
-            total_bs += sz;
-            eprintln!("load {:?}, totol size: {} Byte", &p, sz);
-        }else{
-            eprintln!("failed to load data {:?}", &p);
+        let mut total_bs = 0u32;
+        let mut f = BufReader::new(File::open(p)?);
+        while let Ok(obj_sz) = f.read_u32::<NativeEndian>(){
+            eprintln!("sz: {}", obj_sz);
+            let mut tmp = vec![0;obj_sz as usize];
+            f.read_exact(&mut tmp).unwrap();  // read or write will change seek ptr.
+
+            let v = serde_json::from_slice::<StableEntry>(&tmp).unwrap();
+            match v.st{
+                StableEntryState::Deleted => {
+                    kd.map.remove(&v.key).unwrap();
+                },
+                StableEntryState::Valid => {
+                    let sz = serde_json::to_string(&v)?.as_bytes().len();
+                    kd.map.insert(v.key, MemDirEntry{
+                        fid: fid,
+                        offset: total_bs as u32,
+                        sz: sz as u32,
+                    });
+                },
+            }
+            total_bs += obj_sz + 4;
         }
+        eprintln!("load {:?}, totol size: {} Byte", &p, total_bs);
         Ok(total_bs)
     }
-    
 }

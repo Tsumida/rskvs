@@ -8,9 +8,8 @@ use std::path::PathBuf;
 // use std::sync::{Arc, Mutex};
 
 use std::default::Default;
-
-
 use failure::{Error}; 
+
 use serde::{Serialize, Deserialize};
 use byteorder::{NativeEndian, WriteBytesExt, ReadBytesExt};
 
@@ -20,6 +19,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type Key = String;
 /// Value type.
 pub type Value = String;
+
 
 /// A KvStoree offers method get/set/remove methods like HashMap.
 /// Additionally, KvStore provides stablizability.
@@ -49,7 +49,7 @@ impl KvStore{
     pub fn set(&mut self, key:Key, value:Value) -> Result<()>{
         let (fid, offset, sz) = self.st
             .stablize(key.clone(), value, StableEntryState::Valid)?;
-        eprintln!("set key={}, fid={}, offset={}, size={}", &key, fid, offset, sz);
+        //eprintln!("set key={}, fid={}, offset={}, size={}", &key, fid, offset, sz);
         self.kd.update(&key, fid, offset, sz)?;
         Ok(())
     }
@@ -77,6 +77,7 @@ impl KvStore{
 
     /// Remove the key-value pair for given key. 
     /// It's ok to remove a pair not in the KvStore.
+    /// Return true if the key-value pair is removed, or false if key doesn't exist.
     /// # Example
     /// ```
     /// use rskvs::KvStore;
@@ -86,21 +87,31 @@ impl KvStore{
     /// kvs.remove("abc".to_string());
     /// kvs.remove("abc".to_string()); // double removement, ok
     /// ```
-    pub fn remove(&mut self, key: Key) -> Result<()>{
+    pub fn remove(&mut self, key: Key) -> Result<bool>{
         if !self.kd.map.contains_key(&key){
-            return Ok(());
+            return Ok(false);
         }
         self.st.stablize(key.clone(), String::default(), StableEntryState::Deleted)?;
         self.kd.remove(&key);
-        Ok(())
+        Ok(true)
     }
 
     /// Open the KvStore at a given path. Return the KvStore.
     pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore>{
         let mut kvs = KvStore::new();
-        let mut p = dir_path.into();
+        let mut p:PathBuf = dir_path.into();
+
+        if !p.exists(){
+            std::fs::create_dir_all(&p)?;  
+        }
+
         p.push(0.to_string());
         kvs.set_path(p);
+
+        if let Err(_) = kvs.rebuild(){
+            std::process::exit(-1);
+        }
+
         Ok(kvs)
     }
 
@@ -119,11 +130,10 @@ impl KvStore{
         for (k, v) in &self.kd.map{
             eprintln!("key = {:12} val = {:?}", k, v);
         }
-        eprintln!("======================== Init done ===========================");
+        eprintln!("========================== Init done =========================");
     }
 
     fn set_path(&mut self, path: impl Into<PathBuf>){
-        // check
         self.st.path = path.into();
     }
     
@@ -200,11 +210,6 @@ enum StableEntryState{
     Deleted, 
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-struct FID{
-    fid: u32,
-}
-
 //const SUFFIX_HINT:&str = "hint";
 const EXTENSION_DATA:&str = "data";
 const PATH_FID_LIST:&str = "fids";
@@ -243,7 +248,7 @@ impl StableStorage{
             self.create_new_active_file()?;
         }
 
-        eprintln!("attempt load: fid={}, offset={}, sz={}", fid, offset, sz);
+        // eprintln!("attempt load: fid={}, offset={}, sz={}", fid, offset, sz);
 
         /* =====================================================================
         ref: https://github.com/Tsumida/rskvs/issues/2
@@ -264,7 +269,6 @@ impl StableStorage{
         let se = serde_json::from_slice::<StableEntry>(&buf).unwrap();
 
         assert_eq!(&StableEntryState::Valid, &se.st);
-        eprintln!("get {:?}", &se);
         Ok(se)
     }
 
@@ -288,7 +292,8 @@ impl StableStorage{
         assert_eq!(size, f.write(s.as_bytes())? as u32);
         self.total_bs += size;
 
-        Ok((self.fid, self.total_bs - size, size))  // offset and length
+        // | obj_sz: u32 | json_string |
+        Ok((self.fid, self.total_bs - size - 4, size))  // offset and length
     }
 
     #[inline]
@@ -322,17 +327,18 @@ impl StableStorage{
             f.write_u32::<NativeEndian>(1)?;
         }else{ 
             f.seek(SeekFrom::Start(4)).unwrap(); 
-            f.write_u32::<NativeEndian>(self.fid + 1)?;
+            f.write_u32::<NativeEndian>(self.fid + 1)?;  // [st, end)
         }
         self.path.pop();
         Ok(())
     }
 
+    /// Create new active file. Previous data become immutable.
     fn create_new_active_file(&mut self) -> Result<()>{
         self.fid += 1;
 
         self.path.pop();
-        self.update_fid_list()?;
+        self.update_fid_list()?; // record this new fid.
 
         self.path.push(StableStorage::data_file_name(self.fid));
         let f = std::fs::OpenOptions::new()
@@ -353,18 +359,14 @@ impl StableStorage{
         self.fid = 0;
         let mut kd = KeyDir::new();
         let mut dir_path = self.path.parent().unwrap().to_path_buf();
-        assert_eq!(true, dir_path.is_dir());
 
         // check existance of fids.
         let mut fid_path = dir_path.to_path_buf();
         fid_path.push(PATH_FID_LIST);
         if !fid_path.exists(){
             self.path = dir_path.clone();
-            assert!(self.path.is_dir());
             self.update_fid_list().unwrap();
         }
-
-        //eprintln!("fids: {:?}", &fid_path);
 
         // read fids from PATH_FID_LIST
         let mut bf = BufReader::new(
@@ -374,16 +376,14 @@ impl StableStorage{
 
         let mut fids = Vec::new();
         match bf.read_u32::<NativeEndian>(){
-            Err(e) => {
-                eprintln!("err: {}", e);
-            },
             Ok(st) => {
                 bf.seek(SeekFrom::Start(4)).unwrap();
                 let end = bf.read_u32::<NativeEndian>().unwrap();
                 fids = (st..end).collect();
             },
+            _ => {
+            },
         }
-        // eprintln!("{:?}", &fids);
 
         // read all data files.
         for fid in fids{
@@ -400,15 +400,12 @@ impl StableStorage{
                 self.fid -= 1
             }
             self.create_new_active_file()?;
-
         }
-
         Ok(kd)
     }
 
     /// Rebuild signle data file.
     fn rebuild_from_single(kd:&mut KeyDir, p:&PathBuf, fid: u32) -> Result<u32>{
-        eprintln!("rebuilding from {:?}", p);
         let mut total_bs = 0u32;
         let mut f = BufReader::new(File::open(p)?);
         while let Ok(obj_sz) = f.read_u32::<NativeEndian>(){
@@ -431,7 +428,7 @@ impl StableStorage{
             }
             total_bs += obj_sz + 4;
         }
-        eprintln!("load {:?}, totol size: {} Byte", &p, total_bs);
+        eprintln!();
         Ok(total_bs)
     }
 }

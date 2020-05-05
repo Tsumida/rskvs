@@ -2,6 +2,11 @@ name: kvs
 version: "0.1.0"
 author: Tsuko <tsumida@163.com>
 about: cli for rskvs
+args:
+    - Dir:
+        help: set diretory of storage .
+        short: s
+        takes_value: true
 subcommands:
     - set:
         about: insert or modify key-value pair in kvs.

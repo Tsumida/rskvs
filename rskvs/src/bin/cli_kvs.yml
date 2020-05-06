@@ -1,0 +1,31 @@
+name: kvs
+version: "0.1.0"
+author: Tsuko <tsumida@163.com>
+about: cli for rskvs
+args:
+    - Dir:
+        help: set diretory of storage .
+        short: s
+        takes_value: true
+subcommands:
+    - set:
+        about: insert or modify key-value pair in kvs.
+        args:
+            - KEY:
+                takes_value: true
+                required: true
+            - VALUE:
+                takes_value: true
+                required: true
+    - get:
+        about: Return value corresponding to the given key.
+        args:
+            - KEY:
+                takes_value: true
+                required: true
+    - rm:
+        about: Remove a key-value pair.
+        args:
+            - KEY:
+                takes_value: true
+                required: true

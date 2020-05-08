@@ -11,7 +11,8 @@ fn main() {
         bd.set_path(path);
     }
 
-    let mut kvs = bd.build().unwrap();
+    let mut kvs = bd.set_data_threshold(512).build().unwrap();
+    kvs.init_state();
 
     match matc.subcommand() {
         ("set", Some(sub_set)) => {

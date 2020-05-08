@@ -105,11 +105,11 @@ impl KvStore {
         if !p.exists() {
             std::fs::create_dir_all(&p)?;
         }
-
         p.push(0.to_string());
         kvs.st.path = p;
 
-        if let Err(_) = kvs.rebuild() {
+        if let Err(e) = kvs.rebuild() {
+            eprintln!("{}", e);
             std::process::exit(-1);
         }
 
@@ -251,10 +251,13 @@ enum StableEntryState {
     Deleted,
 }
 
+
+
 const PATH_FID_LIST: &str = "fids";
 
 struct StableStorage {
-    // id of the active file .
+    // [left, right)
+    // right-1 is the number of the active file.
     left: u32,
     right: u32,
     // file size threshold.
@@ -267,6 +270,7 @@ struct StableStorage {
     // path.
     path: PathBuf,
 }
+
 
 impl StableStorage {
     fn new() -> StableStorage {
@@ -283,14 +287,6 @@ impl StableStorage {
     /// TODO: Consider log compaction.
     /// Return Error if there is no such key.
     fn load(&mut self, fid: u32, offset: u32, sz: u32) -> Result<StableEntry> {
-        // open file fid
-        // seek to offset
-        if self.active_f.is_none() || self.reach_threshold() {
-            self.create_new_active_file()?;
-        }
-
-        // eprintln!("attempt load: fid={}, offset={}, sz={}", fid, offset, sz);
-
         /* =====================================================================
         ref: https://github.com/Tsumida/rskvs/issues/2
             offset
@@ -384,7 +380,7 @@ impl StableStorage {
     /// Create new active file. Previous data become immutable.
     fn create_new_active_file(&mut self) -> Result<()> {
         self.right += 1;
-        eprintln!("create active file - {}", self.right - 1);
+        eprintln!("create active file -- {}", self.right - 1);
         self.path.pop();
         self.update_fid_list(self.left, self.right)?; // record this new fid.
 
@@ -492,7 +488,6 @@ impl StableStorage {
         assert!(fid >= left);
 
         dir_p.push(format!("{}.mege", fid));
-
         {
             let mut bf = BufWriter::new(
                 File::create(&dir_p)?
@@ -514,8 +509,6 @@ impl StableStorage {
             }
         }// bf drop here.
         
-        
-        // delete data files. [left, fid]
         let mut tmp = dir_p.clone();
         for fid in left..right{
             tmp.pop();
@@ -536,6 +529,7 @@ impl StableStorage {
         //      | right - 1  ........... act_fid |
         //      |                                |
         //  self.left ----------------------- self.right
+        eprintln!("{} -- ", 99);
         self.left = right - 1;
         self.path = dir_p.clone();
         self.update_fid_list(self.left, self.right).unwrap();

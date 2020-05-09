@@ -1,7 +1,7 @@
 use assert_cmd::prelude::*;
-use rskvs::{KvStore, Result, KvStoreBuilder};
 use predicates::ord::eq;
 use predicates::str::{contains, is_empty, PredicateStrExt};
+use rskvs::{KvStore, KvStoreBuilder, Result};
 use std::process::Command;
 use tempfile::TempDir;
 use walkdir::WalkDir;
@@ -224,7 +224,11 @@ fn overwrite_value() -> Result<()> {
     drop(store);
     let mut store = KvStore::open(temp_dir.path())?;
     assert_eq!(store.get("key1".to_owned())?, Some("value2".to_owned()));
+    assert_eq!(store.get("key1".to_owned())?, Some("value2".to_owned()));
+
+    store.init_state();
     store.set("key1".to_owned(), "value3".to_owned())?;
+    store.init_state();
     assert_eq!(store.get("key1".to_owned())?, Some("value3".to_owned()));
 
     Ok(())
@@ -270,23 +274,26 @@ fn remove_key() -> Result<()> {
 #[test]
 fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+
     let mut store = KvStoreBuilder::new()
-    .set_path(temp_dir.path())
-    .set_data_threshold(1 << 10)
-    .build()?;
+        .set_path(temp_dir.path())
+        .set_data_threshold(1 << 15)
+        .build()?;
 
     for iter in 0..10 {
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
             let value = format!("{}", iter);
+            println!("keyid = {}", key_id);
             store.set(key, value)?;
         }
+
         // reopen and check content.
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
+            eprintln!("---keyid = {}", key_id);
             assert_eq!(store.get(key)?, Some(format!("{}", iter)));
         }
     }
-    
     Ok(())
 }

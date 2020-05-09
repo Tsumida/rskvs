@@ -39,17 +39,15 @@ impl KvStore {
     /// Insert a new key-value pair or update one already exists.
     /// # Example
     /// ```
-    /// use rskvs::KvStore;
-    ///
-    /// let mut kvs = KvStore::new();
-    /// kvs.set("abc".to_string(), "def".to_string());
+    /// use rskvs::KvStoreBuilder;
+    /// let mut kvs =  KvStoreBuilder::new().set_data_threshold(512).build().unwrap();
+    /// kvs.set("key1".to_owned(), "value1".to_owned()).unwrap();
     ///
     /// ```
     pub fn set(&mut self, key: Key, value: Value) -> Result<()> {
-        let (fid, offset, sz) = self
-            .st
-            .stablize(&mut self.kd, key.clone(), value, StableEntryState::Valid)?;
-        //eprintln!("set key={}, fid={}, offset={}, size={}", &key, fid, offset, sz);
+        let (fid, offset, sz) =
+            self.st
+                .stablize(&mut self.kd, key.clone(), value, StableEntryState::Valid)?;
         self.kd.update(&key, fid, offset, sz)?;
         Ok(())
     }
@@ -58,10 +56,10 @@ impl KvStore {
     /// Note that if KeyDir doesn't contains such key, KVStorage won't lookup StableStorage.
     /// # Example1
     /// ```
-    /// use rskvs::KvStore;
+    /// use rskvs::KvStoreBuilder;
     ///
-    /// let mut kvs = KvStore::new();
-    /// kvs.set("abc".to_string(), "def".to_string());
+    /// let mut kvs =  KvStoreBuilder::new().set_data_threshold(512).build().unwrap();
+    /// kvs.set("abc".to_string(), "def".to_string()).unwrap();
     /// assert_eq!("def".to_string(), kvs.get("abc".to_string()).unwrap().unwrap());
     ///
     /// ```
@@ -80,9 +78,9 @@ impl KvStore {
     /// Return true if the key-value pair is removed, or false if key doesn't exist.
     /// # Example
     /// ```
-    /// use rskvs::KvStore;
+    /// use rskvs::KvStoreBuilder;
     ///
-    /// let mut kvs = KvStore::new();
+    /// let mut kvs =  KvStoreBuilder::new().set_data_threshold(512).build().unwrap();
     /// kvs.set("abc".to_string(), "def".to_string());
     /// kvs.remove("abc".to_string());
     /// kvs.remove("abc".to_string()); // double removement, ok
@@ -91,8 +89,12 @@ impl KvStore {
         if !self.kd.map.contains_key(&key) {
             return Ok(false);
         }
-        self.st
-            .stablize(&mut self.kd, key.clone(), String::default(), StableEntryState::Deleted)?;
+        self.st.stablize(
+            &mut self.kd,
+            key.clone(),
+            String::default(),
+            StableEntryState::Deleted,
+        )?;
         self.kd.remove(&key);
         Ok(true)
     }
@@ -138,7 +140,7 @@ impl KvStore {
     }
 
     /// Set data threshold.
-    pub fn set_data_threshold(&mut self, th: u32){
+    pub fn set_data_threshold(&mut self, th: u32) {
         self.st.fsz_th = th;
     }
 }
@@ -251,8 +253,6 @@ enum StableEntryState {
     Deleted,
 }
 
-
-
 const PATH_FID_LIST: &str = "fids";
 
 struct StableStorage {
@@ -270,7 +270,6 @@ struct StableStorage {
     // path.
     path: PathBuf,
 }
-
 
 impl StableStorage {
     fn new() -> StableStorage {
@@ -294,50 +293,57 @@ impl StableStorage {
             | obj_size: u32 | json_string |
         =====================================================================*/
         let fname = self.get_file_path(fid);
-        let mut bf = BufReader::new(File::open(fname)?);
+        let mut bf = BufReader::new(File::open(&fname)?);
         let mut buf = vec![0; sz as usize];
         let _ = bf.seek(SeekFrom::Start(offset as u64))?;
         let obj_size = bf.read_u32::<NativeEndian>().unwrap();
+
         assert_eq!(obj_size, sz);
         bf.read_exact(&mut buf).unwrap();
 
         // deserilization.
         let se = serde_json::from_slice::<StableEntry>(&buf).unwrap();
-
+        eprintln!("{}, {}, {}", fid, offset, sz);
         assert_eq!(&StableEntryState::Valid, &se.st);
         Ok(se)
     }
 
     /// Append key-value pair to active file. Return file id, offset and pair size.
-    fn stablize(&mut self, kd:&mut KeyDir, k: Key, v: Value, st: StableEntryState) -> Result<(u32, u32, u32)> {
+    fn stablize(
+        &mut self,
+        kd: &mut KeyDir,
+        k: Key,
+        v: Value,
+        st: StableEntryState,
+    ) -> Result<(u32, u32, u32)> {
         let se = StableEntry {
             st: st,
             key: k,
             val: v,
         };
 
-        if self.right - self.left >= 5{
+        if self.right - self.left >= 5 {
             let mut dir_p = self.path.clone();
             dir_p.pop();
             self.log_compact(&mut dir_p, kd, self.left, self.right)?;
         }
 
         if self.active_f.is_none() || self.reach_threshold() {
+            eprintln!("{:?}, total_bs={}", self.active_f.is_none(), self.total_bs);
             self.create_new_active_file()?;
         }
         let f = self.active_f.as_mut().unwrap().get_mut();
         let s = serde_json::to_string(&se)?;
         let size = s.as_bytes().len() as u32;
-        self.total_bs = StableStorage::store(f, self.total_bs, s.as_bytes())?;
+        let offset = self.total_bs;
+        self.total_bs = StableStorage::store(f, offset, s.as_bytes())?;
 
-        
-
-        Ok((self.right - 1, self.total_bs - size - 4, size)) // offset and length
+        Ok((self.active_fid(), offset, size)) // offset and length
     }
 
     /// Store.
     #[inline]
-    fn store(mut f: impl Write, mut total_bs: u32, s:&[u8]) -> Result<u32> {
+    fn store(mut f: impl Write, mut total_bs: u32, s: &[u8]) -> Result<u32> {
         let size = s.len() as u32;
         let _ = f.write_u32::<NativeEndian>(size)?;
         total_bs += 4;
@@ -365,13 +371,14 @@ impl StableStorage {
     }
 
     #[inline]
-    fn active_fid(&self) -> u32{
+    fn active_fid(&self) -> u32 {
         self.right - 1
     }
 
     /// 1. left==None
-    fn update_fid_list(&mut self, left: u32, right:u32) -> Result<()> {
+    fn update_fid_list(&mut self, left: u32, right: u32) -> Result<()> {
         // | st: u32 | end: u32 |  -->  [st, end)
+        assert!(self.path.is_dir());
         self.path.push(PATH_FID_LIST);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -388,18 +395,19 @@ impl StableStorage {
     /// Create new active file. Previous data become immutable.
     fn create_new_active_file(&mut self) -> Result<()> {
         self.right += 1;
-        eprintln!("create active file -- {}", self.right - 1);
+        //eprintln!("create active file -- {}", self.active_fid());
         self.path.pop();
         self.update_fid_list(self.left, self.right)?; // record this new fid.
-
-        self.path.push(StableStorage::data_file_name(self.active_fid()));
+        self.path
+            .push(StableStorage::data_file_name(self.active_fid()));
         let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
 
         self.total_bs = f.metadata().unwrap().len() as u32;
-
+        //self.total_bs = 0;
+        //eprintln!("active file size: {}", self.total_bs);
         let nf = BufWriter::new(f);
         self.active_f = Some(nf);
         Ok(())
@@ -420,10 +428,7 @@ impl StableStorage {
         }
 
         // read fids from PATH_FID_LIST
-        let mut bf = BufReader::new(
-            std::fs::OpenOptions::new()
-            .read(true)
-            .open(fid_path)?);
+        let mut bf = BufReader::new(std::fs::OpenOptions::new().read(true).open(fid_path)?);
 
         // update [left, right)
         match bf.read_u32::<NativeEndian>() {
@@ -486,61 +491,64 @@ impl StableStorage {
     }
 
     /// rebuild all file and merge them.
-    fn log_compact(&mut self, dir_p: &mut PathBuf, kd:&mut KeyDir, left: u32, right:u32) -> Result<()>{
-        
-        let fid = right - 1;
-        eprintln!("log compacting... [{}, {})", left, right);
-        assert!(fid >= left);
+    fn log_compact(
+        &mut self,
+        dir_p: &mut PathBuf,
+        kd: &mut KeyDir,
+        left: u32,
+        right: u32,
+    ) -> Result<()> {
+        //eprintln!("log compacting... [{}, {})", left, right);
+        assert!(right > left);
 
-        dir_p.push(format!("{}.mege", fid));
+        dir_p.push(format!("{}.mege", right - 1));
         {
-            let mut bf = BufWriter::new(
-                File::create(&dir_p)?
-            );
+            let mut bf = BufWriter::new(File::create(&dir_p)?);
             let mut meta = Vec::new();
-            for (k, v) in kd.map.iter(){
+            // kd -> meta
+            for (k, v) in kd.map.iter() {
                 meta.push((k.clone(), v.clone()));
             }
-    
             let mut total_bs = 0;
-            for (k, v) in &meta{
-                kd.update(k, fid, total_bs as u32, v.sz).unwrap();
+
+            // moving ..
+            for (k, v) in &meta {
                 let s: StableEntry = self.load(v.fid, v.offset, v.sz).unwrap();
                 bf.write_u32::<NativeEndian>(v.sz).unwrap();
-                total_bs += bf.write(
-                    serde_json::to_string(&s).unwrap().as_bytes()
-                ).unwrap();
-                total_bs += 4;
+                let obj_sz = bf
+                    .write(serde_json::to_string(&s).unwrap().as_bytes())
+                    .unwrap() as u32;
+                kd.update(k, right - 1, total_bs, obj_sz).unwrap();
+
+                assert_eq!(obj_sz, v.sz);
+                total_bs += obj_sz + 4;
             }
-        }// bf drop here.
-        
+            self.total_bs = total_bs as u32;
+        } // bf drop here.
         let mut tmp = dir_p.clone();
-        for fid in left..right{
+        for id in left..right {
             tmp.pop();
-            tmp.push(
-                StableStorage::data_file_name(fid)
-            );
+            tmp.push(StableStorage::data_file_name(id));
             std::fs::remove_file(&tmp).unwrap();
         }
-        
         // rename.
         std::fs::rename(&dir_p, &tmp).unwrap();
         // generate hint file.
 
         // update fid_list
         // |    merge     |
-        // |left, right - 1, right,  ... act_fid | 
+        // |left, right - 1, right,  ... act_fid |
         //      | right - 1  ........... act_fid |
         //      |                                |
         //  self.left ----------------------- self.right
-        eprintln!("log compaction done. ");
         self.left = right - 1;
         tmp.pop();
         self.path = tmp;
         self.update_fid_list(self.left, self.right).unwrap();
-
-        self.right -= 1;
-        self.create_new_active_file()?;
+        self.path
+            .push(StableStorage::data_file_name(self.active_fid()));
+        //self.right -= 1;
+        //self.create_new_active_file()?;
         Ok(())
     }
 }

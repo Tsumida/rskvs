@@ -48,7 +48,7 @@ impl KvStore {
     pub fn set(&mut self, key: Key, value: Value) -> Result<()> {
         let (fid, offset, sz) = self
             .st
-            .stablize(key.clone(), value, StableEntryState::Valid)?;
+            .stablize(&mut self.kd, key.clone(), value, StableEntryState::Valid)?;
         //eprintln!("set key={}, fid={}, offset={}, size={}", &key, fid, offset, sz);
         self.kd.update(&key, fid, offset, sz)?;
         Ok(())
@@ -92,7 +92,7 @@ impl KvStore {
             return Ok(false);
         }
         self.st
-            .stablize(key.clone(), String::default(), StableEntryState::Deleted)?;
+            .stablize(&mut self.kd, key.clone(), String::default(), StableEntryState::Deleted)?;
         self.kd.remove(&key);
         Ok(true)
     }
@@ -144,15 +144,15 @@ impl KvStore {
 }
 
 /// Builder for KVStore.
-pub struct KVStoreBuilder {
+pub struct KvStoreBuilder {
     path: Option<PathBuf>,
     fsz_th: u32,
 }
 
-impl KVStoreBuilder {
+impl KvStoreBuilder {
     /// Create new builder.
-    pub fn new() -> KVStoreBuilder {
-        KVStoreBuilder {
+    pub fn new() -> KvStoreBuilder {
+        KvStoreBuilder {
             path: None,
             fsz_th: 512,
         }
@@ -309,12 +309,18 @@ impl StableStorage {
     }
 
     /// Append key-value pair to active file. Return file id, offset and pair size.
-    fn stablize(&mut self, k: Key, v: Value, st: StableEntryState) -> Result<(u32, u32, u32)> {
+    fn stablize(&mut self, kd:&mut KeyDir, k: Key, v: Value, st: StableEntryState) -> Result<(u32, u32, u32)> {
         let se = StableEntry {
             st: st,
             key: k,
             val: v,
         };
+
+        if self.right - self.left >= 5{
+            let mut dir_p = self.path.clone();
+            dir_p.pop();
+            self.log_compact(&mut dir_p, kd, self.left, self.right)?;
+        }
 
         if self.active_f.is_none() || self.reach_threshold() {
             self.create_new_active_file()?;
@@ -323,6 +329,8 @@ impl StableStorage {
         let s = serde_json::to_string(&se)?;
         let size = s.as_bytes().len() as u32;
         self.total_bs = StableStorage::store(f, self.total_bs, s.as_bytes())?;
+
+        
 
         Ok((self.right - 1, self.total_bs - size - 4, size)) // offset and length
     }
@@ -434,10 +442,6 @@ impl StableStorage {
             dir_path.pop();
         }
 
-        if self.right > self.left{
-            self.log_compact(&mut dir_path,&mut kd, self.left, self.right).unwrap();
-        }
-
         self.path = dir_path;
         self.path.push(StableStorage::data_file_name(0));
         if self.right > self.left {
@@ -483,8 +487,9 @@ impl StableStorage {
 
     /// rebuild all file and merge them.
     fn log_compact(&mut self, dir_p: &mut PathBuf, kd:&mut KeyDir, left: u32, right:u32) -> Result<()>{
+        
         let fid = right - 1;
-        eprintln!("log compacting... {}-{}", left, right);
+        eprintln!("log compacting... [{}, {})", left, right);
         assert!(fid >= left);
 
         dir_p.push(format!("{}.mege", fid));
@@ -519,8 +524,7 @@ impl StableStorage {
         }
         
         // rename.
-        std::fs::rename(dir_p.clone(), tmp).unwrap();
-        dir_p.pop();
+        std::fs::rename(&dir_p, &tmp).unwrap();
         // generate hint file.
 
         // update fid_list
@@ -529,11 +533,14 @@ impl StableStorage {
         //      | right - 1  ........... act_fid |
         //      |                                |
         //  self.left ----------------------- self.right
-        eprintln!("{} -- ", 99);
+        eprintln!("log compaction done. ");
         self.left = right - 1;
-        self.path = dir_p.clone();
+        tmp.pop();
+        self.path = tmp;
         self.update_fid_list(self.left, self.right).unwrap();
 
+        self.right -= 1;
+        self.create_new_active_file()?;
         Ok(())
     }
 }

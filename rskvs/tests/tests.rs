@@ -1,5 +1,5 @@
 use assert_cmd::prelude::*;
-use rskvs::{KvStore, Result};
+use rskvs::{KvStore, Result, KvStoreBuilder};
 use predicates::ord::eq;
 use predicates::str::{contains, is_empty, PredicateStrExt};
 use std::process::Command;
@@ -30,8 +30,6 @@ fn cli_get_non_existent_key() {
         .unwrap()
         .args(&["-s", temp_dir.path().to_str().unwrap()])
         .args(&["get", "key1"])
-        // remove below statement, 
-        //.current_dir(&temp_dir)
         .assert()
         .success()
         .stdout(contains("Key not found").trim());
@@ -45,7 +43,6 @@ fn cli_rm_non_existent_key() {
         .unwrap()
         .args(&["-s", temp_dir.path().to_str().unwrap()])
         .args(&["rm", "key1"])
-        //.current_dir(&temp_dir)
         .assert()
         .failure()
         .stdout(eq("Key not found").trim());
@@ -77,7 +74,6 @@ fn cli_get_stored() -> Result<()> {
         .unwrap()
         .args(&["-s", temp_dir.path().to_str().unwrap()])
         .args(&["get", "key1"])
-        //.current_dir(&temp_dir)
         .assert()
         .success()
         .stdout(eq("value1").trim());
@@ -86,7 +82,6 @@ fn cli_get_stored() -> Result<()> {
         .unwrap()
         .args(&["-s", temp_dir.path().to_str().unwrap()])
         .args(&["get", "key2"])
-        //.current_dir(&temp_dir)
         .assert()
         .success()
         .stdout(eq("value2").trim());
@@ -107,7 +102,6 @@ fn cli_rm_stored() -> Result<()> {
         .unwrap()
         .args(&["-s", temp_dir.path().to_str().unwrap()])
         .args(&["rm", "key1"])
-        //.current_dir(&temp_dir)
         .assert()
         .success()
         .stdout(is_empty());
@@ -116,7 +110,6 @@ fn cli_rm_stored() -> Result<()> {
         .unwrap()
         .args(&["-s", temp_dir.path().to_str().unwrap()])
         .args(&["get", "key1"])
-        //.current_dir(&temp_dir)
         .assert()
         .success()
         .stdout(eq("Key not found").trim());
@@ -275,46 +268,25 @@ fn remove_key() -> Result<()> {
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
 #[test]
-#[ignore]
 fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = KvStore::open(temp_dir.path())?;
+    let mut store = KvStoreBuilder::new()
+    .set_path(temp_dir.path())
+    .set_data_threshold(1 << 10)
+    .build()?;
 
-    let dir_size = || {
-        let entries = WalkDir::new(temp_dir.path()).into_iter();
-        let len: walkdir::Result<u64> = entries
-            .map(|res| {
-                res.and_then(|entry| entry.metadata())
-                    .map(|metadata| metadata.len())
-            })
-            .sum();
-        len.expect("fail to get directory size")
-    };
-
-    let mut current_size = dir_size();
-    for iter in 0..1000 {
+    for iter in 0..10 {
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
             let value = format!("{}", iter);
             store.set(key, value)?;
         }
-
-        let new_size = dir_size();
-        if new_size > current_size {
-            current_size = new_size;
-            continue;
-        }
-        // Compaction triggered.
-
-        drop(store);
         // reopen and check content.
-        let mut store = KvStore::open(temp_dir.path())?;
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
             assert_eq!(store.get(key)?, Some(format!("{}", iter)));
         }
-        return Ok(());
     }
-
-    panic!("No compaction detected");
+    
+    Ok(())
 }

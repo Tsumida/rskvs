@@ -1,12 +1,12 @@
 #[macro_use]
 extern crate clap;
 use clap::App;
-use rskvs::KVStoreBuilder;
+use rskvs::KvStoreBuilder;
 
 fn main() {
     let yaml = load_yaml!("cli_kvs.yml"); // static checking.
     let matc = App::from_yaml(&yaml).get_matches();
-    let mut bd = KVStoreBuilder::new();
+    let mut bd = KvStoreBuilder::new();
     if let Some(path) = matc.value_of("Dir") {
         bd.set_path(path);
     }

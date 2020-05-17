@@ -9,7 +9,12 @@ use walkdir::WalkDir;
 // `kvs` with no args should exit with a non-zero code.
 #[test]
 fn cli_no_args() {
-    Command::cargo_bin("kvs").unwrap().assert().failure();
+    let temp_dir = TempDir::new().unwrap();
+    Command::cargo_bin("kvs")
+        .unwrap()
+        .args(&["-s", temp_dir.path().to_str().unwrap()])
+        .assert()
+        .failure();
 }
 
 // `kvs -V` should print the version
@@ -272,13 +277,15 @@ fn remove_key() -> Result<()> {
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
 #[test]
-fn compaction() -> Result<()> {
+fn compression() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
 
     let mut store = KvStoreBuilder::new()
-        .set_path(temp_dir.path())
+        .set_dir_path(temp_dir.path())
         .set_data_threshold(1 << 15)
         .build()?;
+
+    store.init_state();
 
     for iter in 0..10 {
         for key_id in 0..1000 {
@@ -287,11 +294,11 @@ fn compaction() -> Result<()> {
             println!("keyid = {}", key_id);
             store.set(key, value)?;
         }
-
+        store.init_state();
         // reopen and check content.
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
-            eprintln!("---keyid = {}", key_id);
+            eprintln!("check keyid = {}", key_id);
             assert_eq!(store.get(key)?, Some(format!("{}", iter)));
         }
     }

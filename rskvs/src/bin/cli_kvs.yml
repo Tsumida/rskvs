@@ -3,11 +3,34 @@ version: "0.1.0"
 author: Tsuko <tsumida@163.com>
 about: cli for rskvs
 args:
-    - Dir:
-        help: set diretory of storage .
+    - dir:
+        help: Set diretory of storage .
         short: s
         takes_value: true
+    - compress:
+        help: Enable log compress. "yes" or "no"
+        short: p
+        takes_value: true
 subcommands:
+    - bench:
+        about: Take benchmark for read, write, write without log compression.
+        args:
+            - WRITE_NO_COMPRESSION:
+                help: benchmark for 20,000 write with log compression disabled.
+                short: n
+                takes_value: false
+            - WRITE:
+                short: w
+                takes_value: false
+                help: benchmark for 20,000 write.
+            - READ:
+                short: r
+                takes_value: false
+                help: benchmark for 20,000 read.
+            - SIZE:
+                short: s
+                help: size of benchmark.
+
     - set:
         about: insert or modify key-value pair in kvs.
         args:

@@ -17,3 +17,12 @@ walkdir = "2.3.1"
 serde = ""
 serde_json = ""
 byteorder = ""
+criterion = ""
+rand = ""
+
+[[bench]]
+name = "my_benchmark"
+harness = false
+
+[profile.release]
+debug = true

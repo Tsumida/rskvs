@@ -1,7 +1,7 @@
 #![deny(missing_docs)]
 //! rskvs is a little key-value storage.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -102,16 +102,14 @@ impl KvStore {
     /// Open the KvStore at a given path. Return the KvStore.
     pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore> {
         let mut kvs = KvStore::new();
-        let mut p: PathBuf = dir_path.into();
+        kvs.st.dir_path = dir_path.into();
 
-        if !p.exists() {
-            std::fs::create_dir_all(&p)?;
+        if !kvs.st.dir_path.exists() {
+            std::fs::create_dir_all(&kvs.st.dir_path)?;
         }
-        p.push(0.to_string());
-        kvs.st.path = p;
+        kvs.st.active_path = kvs.st.dir_path.clone();
 
         if let Err(e) = kvs.rebuild() {
-            eprintln!("{}", e);
             std::process::exit(-1);
         }
 
@@ -129,9 +127,13 @@ impl KvStore {
     pub fn init_state(&self) {
         eprintln!("========================== KVS state =========================");
         eprintln!(
-            "StableStorage status:\ntotal_bs:{}\nleft={}, right={}\npath={:?}",
-            self.st.total_bs, self.st.left, self.st.right, &self.st.path
+            "StableStorage status:\ntotal_bs:{}\nleft={}, right={}\ndir_path={:?}",
+            self.st.total_bs, self.st.left, self.st.right, &self.st.dir_path
         );
+        eprintln!("========================== Readers ===========================");
+        for k in self.st.readers.keys() {
+            eprintln!("fid = {}", k);
+        }
         eprintln!("========================== Key Dir ===========================");
         for (k, v) in &self.kd.map {
             eprintln!("key = {:12} val = {:?}", k, v);
@@ -149,6 +151,7 @@ impl KvStore {
 pub struct KvStoreBuilder {
     path: Option<PathBuf>,
     fsz_th: u32,
+    enable_compress: bool,
 }
 
 impl KvStoreBuilder {
@@ -157,11 +160,12 @@ impl KvStoreBuilder {
         KvStoreBuilder {
             path: None,
             fsz_th: 512,
+            enable_compress: true,
         }
     }
 
     /// Set directory for persistent data.
-    pub fn set_path(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+    pub fn set_dir_path(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.path = Some(path.into());
         self
     }
@@ -169,6 +173,12 @@ impl KvStoreBuilder {
     /// Set threshold of data file size.
     pub fn set_data_threshold(&mut self, th: u32) -> &mut Self {
         self.fsz_th = th;
+        self
+    }
+
+    /// Enable or disable log compression.
+    pub fn enable_log_compress(&mut self, b: bool) -> &mut Self {
+        self.enable_compress = b;
         self
     }
 
@@ -181,6 +191,7 @@ impl KvStoreBuilder {
         };
         let mut kvs = KvStore::open(p)?;
         kvs.set_data_threshold(self.fsz_th);
+        kvs.st.enable_log_compress = self.enable_compress;
         Ok(kvs)
     }
 }
@@ -217,11 +228,13 @@ impl KeyDir {
         }
     }
 
+    #[inline]
     /// Get Key directory entry.
     fn get(&self, k: &Key) -> Option<&MemDirEntry> {
         self.map.get(k)
     }
 
+    #[inline]
     /// Update diretory entry.
     fn update(&mut self, k: &Key, fid: u32, offset: u32, sz: u32) -> Result<()> {
         let e = self.map.entry(k.clone()).or_insert(MemDirEntry::default());
@@ -231,6 +244,7 @@ impl KeyDir {
         Ok(())
     }
 
+    #[inline]
     fn remove(&mut self, k: &Key) {
         let _ = self.map.remove(k);
     }
@@ -264,11 +278,19 @@ struct StableStorage {
     // When a active file reach this value, it will be closed and become immutable.
     fsz_th: u32,
 
+    // Bufferd reader
+    readers: BTreeMap<u32, BufReader<File>>,
+
     active_f: Option<BufWriter<File>>,
     // = len(file), Bytes.
     total_bs: u32,
+
+    // dir_path
+    dir_path: PathBuf,
     // path.
-    path: PathBuf,
+    active_path: PathBuf,
+
+    enable_log_compress: bool,
 }
 
 impl StableStorage {
@@ -277,9 +299,12 @@ impl StableStorage {
             left: 1,
             right: 1,
             fsz_th: 4096,
+            readers: BTreeMap::new(),
             active_f: None,
             total_bs: 0,
-            path: PathBuf::new(),
+            dir_path: PathBuf::new(),
+            active_path: PathBuf::new(),
+            enable_log_compress: true,
         }
     }
 
@@ -292,20 +317,42 @@ impl StableStorage {
             |
             | obj_size: u32 | json_string |
         =====================================================================*/
-        let fname = self.get_file_path(fid);
-        let mut bf = BufReader::new(File::open(&fname)?);
         let mut buf = vec![0; sz as usize];
-        let _ = bf.seek(SeekFrom::Start(offset as u64))?;
-        let obj_size = bf.read_u32::<NativeEndian>().unwrap();
+
+        assert!(self.left <= fid && fid < self.right);
+
+        let reader = self.readers.get_mut(&fid).unwrap();
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        let obj_size = reader.read_u32::<NativeEndian>().unwrap();
 
         assert_eq!(obj_size, sz);
-        bf.read_exact(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
 
         // deserilization.
         let se = serde_json::from_slice::<StableEntry>(&buf).unwrap();
-        eprintln!("{}, {}, {}", fid, offset, sz);
         assert_eq!(&StableEntryState::Valid, &se.st);
         Ok(se)
+    }
+
+    /// Load raw bytes without deserializaion.
+    fn load_raw(&mut self, fid: u32, offset: u32, sz: u32) -> Result<Vec<u8>> {
+        /* =====================================================================
+        ref: https://github.com/Tsumida/rskvs/issues/2
+            offset
+            |
+            | obj_size: u32 | json_string |
+        =====================================================================*/
+        let mut buf = vec![0; sz as usize];
+        assert!(self.left <= fid && fid < self.right);
+        let reader = self.readers.get_mut(&fid).unwrap();
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        let obj_size = reader.read_u32::<NativeEndian>().unwrap();
+
+        assert_eq!(obj_size, sz);
+        reader.read_exact(&mut buf).unwrap();
+
+        // deserilization.
+        Ok(buf)
     }
 
     /// Append key-value pair to active file. Return file id, offset and pair size.
@@ -322,16 +369,19 @@ impl StableStorage {
             val: v,
         };
 
-        if self.right - self.left >= 5 {
-            let mut dir_p = self.path.clone();
-            dir_p.pop();
-            self.log_compact(&mut dir_p, kd, self.left, self.right)?;
+        if self.right - self.left >= 5 && self.enable_log_compress {
+            self.log_compress(kd, self.left, self.right)?; // self.left changed.
+            self.rebuild_readers(self.left, self.right)?;
         }
 
         if self.active_f.is_none() || self.reach_threshold() {
-            eprintln!("{:?}, total_bs={}", self.active_f.is_none(), self.total_bs);
             self.create_new_active_file()?;
         }
+
+        if !self.readers.contains_key(&self.active_fid()) {
+            self.insert_new_reader(self.active_fid())?;
+        }
+
         let f = self.active_f.as_mut().unwrap().get_mut();
         let s = serde_json::to_string(&se)?;
         let size = s.as_bytes().len() as u32;
@@ -359,13 +409,6 @@ impl StableStorage {
     }
 
     #[inline]
-    fn get_file_path(&self, fid: u32) -> PathBuf {
-        let mut pp = self.path.parent().unwrap().to_path_buf();
-        pp.push(StableStorage::data_file_name(fid));
-        pp
-    }
-
-    #[inline]
     fn data_file_name(fid: u32) -> String {
         fid.to_string()
     }
@@ -375,17 +418,24 @@ impl StableStorage {
         self.right - 1
     }
 
+    fn insert_new_reader(&mut self, fid: u32) -> Result<()> {
+        let mut p = self.dir_path.clone();
+        p.push(StableStorage::data_file_name(fid));
+        let bf = BufReader::new(File::open(p)?);
+        self.readers.insert(fid, bf);
+        Ok(())
+    }
+
     /// 1. left==None
     fn update_fid_list(&mut self, left: u32, right: u32) -> Result<()> {
         // | st: u32 | end: u32 |  -->  [st, end)
-        assert!(self.path.is_dir());
-        self.path.push(PATH_FID_LIST);
+        let mut p = self.dir_path.clone();
+        p.push(PATH_FID_LIST);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(&self.path)?;
-        self.path.pop();
+            .open(&p)?;
 
         f.write_u32::<NativeEndian>(left)?;
         f.write_u32::<NativeEndian>(right)?;
@@ -396,34 +446,32 @@ impl StableStorage {
     fn create_new_active_file(&mut self) -> Result<()> {
         self.right += 1;
         //eprintln!("create active file -- {}", self.active_fid());
-        self.path.pop();
         self.update_fid_list(self.left, self.right)?; // record this new fid.
-        self.path
+
+        self.active_path = self.dir_path.clone();
+        self.active_path
             .push(StableStorage::data_file_name(self.active_fid()));
         let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)?;
+            .open(&self.active_path)?;
 
         self.total_bs = f.metadata().unwrap().len() as u32;
         //self.total_bs = 0;
         //eprintln!("active file size: {}", self.total_bs);
-        let nf = BufWriter::new(f);
-        self.active_f = Some(nf);
+        self.active_f = Some(BufWriter::new(f));
         Ok(())
     }
 
     /// Rebuild KeyDir before KVStorage is available for user.
     fn rebuild_from_all(&mut self) -> Result<KeyDir> {
-        //self.fid = 0;
         let mut kd = KeyDir::new();
-        let mut dir_path = self.path.parent().unwrap().to_path_buf();
+        let mut dir_path = self.dir_path.clone();
 
         // check existance of fids.
-        let mut fid_path = dir_path.to_path_buf();
+        let mut fid_path = dir_path.clone();
         fid_path.push(PATH_FID_LIST);
         if !fid_path.exists() {
-            self.path = dir_path.clone();
             self.update_fid_list(1, 1).unwrap();
         }
 
@@ -445,10 +493,8 @@ impl StableStorage {
             dir_path.push(StableStorage::data_file_name(fid));
             self.total_bs = StableStorage::rebuild_from_single(&mut kd, &dir_path, fid)?;
             dir_path.pop();
+            self.insert_new_reader(fid)?;
         }
-
-        self.path = dir_path;
-        self.path.push(StableStorage::data_file_name(0));
         if self.right > self.left {
             if !self.reach_threshold() {
                 self.right -= 1
@@ -486,24 +532,31 @@ impl StableStorage {
             }
             total_bs += obj_sz + 4;
         }
-        eprintln!();
         Ok(total_bs)
     }
 
-    /// rebuild all file and merge them.
-    fn log_compact(
-        &mut self,
-        dir_p: &mut PathBuf,
-        kd: &mut KeyDir,
-        left: u32,
-        right: u32,
-    ) -> Result<()> {
-        //eprintln!("log compacting... [{}, {})", left, right);
+    fn rebuild_readers(&mut self, left: u32, right: u32) -> Result<()> {
+        let mut p = self.dir_path.clone();
+        for id in left..right {
+            p.push(StableStorage::data_file_name(id));
+            self.readers.insert(id, BufReader::new(File::open(&p)?));
+            p.pop();
+        }
+        Ok(())
+    }
+
+    /// Take log entires in [left, right), moving them into file numbered right - 1.
+    fn log_compress(&mut self, kd: &mut KeyDir, left: u32, right: u32) -> Result<()> {
         assert!(right > left);
 
-        dir_p.push(format!("{}.mege", right - 1));
+        let mut merged_path = self.dir_path.clone();
+        let mut tmp = self.dir_path.clone();
+        let fid = right - 1;
+
+        merged_path.push(format!("{}.mege", fid));
+        // moving log entries...
         {
-            let mut bf = BufWriter::new(File::create(&dir_p)?);
+            let mut bf = BufWriter::new(File::create(&merged_path)?);
             let mut meta = Vec::new();
             // kd -> meta
             for (k, v) in kd.map.iter() {
@@ -513,42 +566,40 @@ impl StableStorage {
 
             // moving ..
             for (k, v) in &meta {
-                let s: StableEntry = self.load(v.fid, v.offset, v.sz).unwrap();
+                let buf = self.load_raw(v.fid, v.offset, v.sz).unwrap();
                 bf.write_u32::<NativeEndian>(v.sz).unwrap();
-                let obj_sz = bf
-                    .write(serde_json::to_string(&s).unwrap().as_bytes())
-                    .unwrap() as u32;
-                kd.update(k, right - 1, total_bs, obj_sz).unwrap();
+                let obj_sz = bf.write(&buf).unwrap() as u32;
+                kd.update(k, fid, total_bs, obj_sz).unwrap();
 
                 assert_eq!(obj_sz, v.sz);
                 total_bs += obj_sz + 4;
             }
             self.total_bs = total_bs as u32;
         } // bf drop here.
-        let mut tmp = dir_p.clone();
         for id in left..right {
-            tmp.pop();
             tmp.push(StableStorage::data_file_name(id));
             std::fs::remove_file(&tmp).unwrap();
+            self.readers.remove(&id);
+            tmp.pop();
         }
         // rename.
-        std::fs::rename(&dir_p, &tmp).unwrap();
+        tmp.push(StableStorage::data_file_name(fid));
+        std::fs::rename(&merged_path, &tmp).unwrap();
         // generate hint file.
 
         // update fid_list
-        // |    merge     |
-        // |left, right - 1, right,  ... act_fid |
-        //      | right - 1  ........... act_fid |
-        //      |                                |
+        // |    compressed     |
+        // |left,        right - 1, right,  ... act_fid |
+        //      |        right - 1  ........... act_fid |
+        //      |                                  |
         //  self.left ----------------------- self.right
         self.left = right - 1;
-        tmp.pop();
-        self.path = tmp;
+        self.active_path = self.dir_path.clone();
         self.update_fid_list(self.left, self.right).unwrap();
-        self.path
+        self.active_path
             .push(StableStorage::data_file_name(self.active_fid()));
-        //self.right -= 1;
-        //self.create_new_active_file()?;
+
+        eprintln!("compression done. [{}, {})", left, right);
         Ok(())
     }
 }

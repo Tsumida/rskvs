@@ -599,7 +599,6 @@ impl StableStorage {
         self.active_path
             .push(StableStorage::data_file_name(self.active_fid()));
 
-        eprintln!("compression done. [{}, {})", left, right);
         Ok(())
     }
 }

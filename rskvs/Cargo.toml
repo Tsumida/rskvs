@@ -19,10 +19,6 @@ serde_json = ""
 byteorder = ""
 criterion = ""
 rand = ""
+log = ""
+simplelog = ""
 
-[[bench]]
-name = "my_benchmark"
-harness = false
-
-[profile.release]
-debug = true

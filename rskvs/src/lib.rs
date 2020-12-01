@@ -1,17 +1,34 @@
-#![deny(missing_docs)]
+//#![deny(missing_docs)]
 //! rskvs is a little key-value storage.
 
-use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-// use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::{
+    collections::{BTreeMap, HashMap},
+    unimplemented,
+};
+
+use log::{debug, error, info};
 
 use failure::Error;
 use std::default::Default;
 
 use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
+
+/// State about compreesing.
+const STATE_DONE: u8 = 0;
+const STATE_COMPRESSING: u8 = 1;
+
+const KB: u64 = 1 << 10;
+const MB: u64 = 1 << 20;
+
+const DEFAULT_ITEM_NUM: u32 = 3;
+const DEFAULT_DUP_MIN_TH: u64 = 10 * KB;
+const DEFAULT_DUP_PROP: f64 = 0.5;
 
 /// Result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -20,19 +37,101 @@ pub type Key = String;
 /// Value type.
 pub type Value = String;
 
+#[derive(Debug, Clone)]
+/// Statistic for compressing
+pub struct Stat {
+    total: u64,
+    dup_byte_size: u64,
+    dup_th_prop: f64,
+    dup_th_min: u64,
+}
+
+impl Stat {
+    fn new(dup_th_prop: f64, dup_th_min: u64) -> Self {
+        Stat {
+            total: 0,
+            dup_byte_size: 0,
+            dup_th_min,
+            dup_th_prop,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.dup_byte_size = 0;
+    }
+
+    fn increase_dup_size(&mut self, delta: u64) {
+        self.dup_byte_size += delta;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Cmd {
+    Get(String),
+    Set(String, String),
+    Remove(String),
+    Batch(Vec<Cmd>),
+    Tx(Vec<Cmd>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Reply {
+    Get(Option<String>),
+    Set(bool),
+    Remove(bool),
+    Batch(Vec<Reply>),
+    Tx(Vec<Reply>),
+}
+
+pub type Request = (Cmd, SyncSender<Reply>);
+
+pub struct KvAdaptor {
+    // to recvr
+    pub op_sender: SyncSender<Request>,
+}
+
+#[derive(Debug)]
+pub struct CompressInfo {
+    stat: Stat,
+    dir_path: PathBuf,
+    merged_log_path: PathBuf,
+    left: u32,
+    right: u32,
+    kd: KeyDir,
+}
+
 /// A KvStoree offers method get/set/remove methods like HashMap.
 /// Additionally, KvStore provides stablizability.
 pub struct KvStore {
     kd: KeyDir,
     st: StableStorage,
+
+    //op_sender: SyncSender<Request>,
+    op_recvr: Receiver<Request>,
+
+    compress_state: AtomicU8,
+    compress_notifier: SyncSender<CompressInfo>,
+    compress_done: Receiver<CompressInfo>,
 }
 
 impl KvStore {
     /// Create a empty KvStore.
-    pub fn new() -> Self {
+    pub fn new(op_recvr: Receiver<Request>) -> Self {
+        // TODO:
+        let (compress_notifier, cmp_recvr) = sync_channel(4);
+        let (done_sender, compress_done) = sync_channel(4);
+
+        std::thread::spawn(move || {
+            KvStore::compress(cmp_recvr, done_sender).unwrap();
+        });
+
         KvStore {
             kd: KeyDir::new(),
             st: StableStorage::new(),
+            op_recvr,
+            compress_state: AtomicU8::new(0),
+            compress_notifier,
+            compress_done,
         }
     }
 
@@ -45,10 +144,12 @@ impl KvStore {
     ///
     /// ```
     pub fn set(&mut self, key: Key, value: Value) -> Result<()> {
+        let stale_sz = self.kd.get(&key).map_or(0, |e| e.sz);
         let (fid, offset, sz) =
             self.st
-                .stablize(&mut self.kd, key.clone(), value, StableEntryState::Valid)?;
+                .stablize(key.clone(), value, StableEntryState::Valid, stale_sz)?;
         self.kd.update(&key, fid, offset, sz)?;
+
         Ok(())
     }
 
@@ -86,22 +187,23 @@ impl KvStore {
     /// kvs.remove("abc".to_string()); // double removement, ok
     /// ```
     pub fn remove(&mut self, key: Key) -> Result<bool> {
-        if !self.kd.map.contains_key(&key) {
+        let stale_sz = self.kd.remove(&key);
+        if stale_sz == 0 {
             return Ok(false);
         }
-        self.st.stablize(
-            &mut self.kd,
+        let _ = self.st.stablize(
             key.clone(),
             String::default(),
             StableEntryState::Deleted,
+            stale_sz,
         )?;
-        self.kd.remove(&key);
         Ok(true)
     }
 
     /// Open the KvStore at a given path. Return the KvStore.
-    pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore> {
-        let mut kvs = KvStore::new();
+    pub fn open(dir_path: impl Into<PathBuf>) -> Result<(KvAdaptor, KvStore)> {
+        let (req_s, req_r) = sync_channel(128);
+        let mut kvs = KvStore::new(req_r);
         kvs.st.dir_path = dir_path.into();
 
         if !kvs.st.dir_path.exists() {
@@ -113,13 +215,14 @@ impl KvStore {
             std::process::exit(-1);
         }
 
-        Ok(kvs)
+        Ok((KvAdaptor { op_sender: req_s }, kvs))
     }
 
     /// Rebuild KeyDir from data file or hint file.
     pub fn rebuild(&mut self) -> Result<()> {
         let hmap = self.st.rebuild_from_all()?;
         self.kd = hmap;
+
         Ok(())
     }
 
@@ -127,8 +230,12 @@ impl KvStore {
     pub fn init_state(&self) {
         eprintln!("========================== KVS state =========================");
         eprintln!(
-            "StableStorage status:\ntotal_bs:{}\nleft={}, right={}\ndir_path={:?}",
-            self.st.total_bs, self.st.left, self.st.right, &self.st.dir_path
+            "StableStorage status:\ntotal_bs:{}\nleft={}, right={}\ndir_path={:?}\nstale_size:{}\n",
+            self.st.last_file_size(),
+            self.st.left,
+            self.st.right,
+            &self.st.dir_path,
+            self.st.stat.dup_byte_size,
         );
         eprintln!("========================== Readers ===========================");
         for k in self.st.readers.keys() {
@@ -145,6 +252,156 @@ impl KvStore {
     pub fn set_data_threshold(&mut self, th: u32) {
         self.st.fsz_th = th;
     }
+
+    /// Start kvs engine.
+    pub fn run(&mut self) {
+        info!("kvs up");
+        let mut down = false;
+        // open compressor
+        loop {
+            match self.op_recvr.recv() {
+                Ok(req) => {
+                    if let Err(e) = self.process_cmd(req) {
+                        error!("{}", e);
+                        down = true;
+                    }
+                }
+                Err(_) => {
+                    down = true;
+                }
+            }
+            if !down && !self.is_compressing() && self.need_compress() {
+                // active file excluded
+                let kd = self.kd.clone();
+                self.update_compress_state(STATE_COMPRESSING);
+                self.compress_notifier
+                    .send(CompressInfo {
+                        stat: self.st.stat.clone(),
+                        kd,
+                        dir_path: self.st.dir_path.clone(),
+                        merged_log_path: self.st.dir_path.clone(),
+                        left: self.st.left,
+                        right: self.st.right,
+                    })
+                    .unwrap();
+            }
+            if let Ok(cmp_info) = self.compress_done.try_recv() {
+                self.merge_compress_result(cmp_info).unwrap();
+                self.update_compress_state(STATE_DONE);
+            }
+            if down {
+                break;
+            }
+        }
+        info!("kvs down");
+    }
+
+    fn need_compress(&self) -> bool {
+        let stat = &self.st.stat;
+        stat.dup_byte_size >= stat.dup_th_min
+            && stat.dup_byte_size >= (stat.total as f64 * stat.dup_th_prop) as u64
+            // at least one file (active log executed).
+            && self.st.left + 1 + DEFAULT_ITEM_NUM < self.st.right
+    }
+
+    fn is_compressing_completed(&self) -> bool {
+        self.compress_state.load(Ordering::SeqCst) == STATE_DONE
+    }
+
+    fn is_compressing(&self) -> bool {
+        self.compress_state.load(Ordering::SeqCst) == STATE_COMPRESSING
+    }
+
+    fn update_compress_state(&mut self, new_state: u8) {
+        self.compress_state.store(new_state, Ordering::SeqCst);
+    }
+
+    fn update_key_dir(&mut self, cmp_info: &CompressInfo) {
+        let (left, last) = (cmp_info.left, cmp_info.right - 1);
+        let cmp_kd = &cmp_info.kd.map;
+        // merging keydir and remove entries with tombstone
+        self.kd.map.retain(|k, v| {
+            // keep entries in previous or current active log.
+            v.fid >= last
+            // update entries in merging internal 
+                || (cmp_kd.get(k).map_or(false, |v_merged| {
+                    *v = v_merged.clone();
+                    true
+                }))
+        });
+    }
+
+    fn merge_compress_result(&mut self, cmp_info: CompressInfo) -> Result<()> {
+        self.update_key_dir(&cmp_info);
+        self.delete_stale_log(cmp_info.dir_path, cmp_info.left, cmp_info.right - 2)?;
+
+        // update dup_byte_size
+        self.st.stat.dup_byte_size -= cmp_info.stat.dup_byte_size;
+        //  left           right
+        // [1, 2, 3, 4, 5, 6)
+        //        3, 4, 5, 6)
+        // |-------|  |
+        //   merged   | active log
+        self.st.left = cmp_info.right - 2;
+
+        // rename
+        let mut new_name = cmp_info.merged_log_path.clone();
+        new_name.pop();
+        new_name.push(StableStorage::data_file_name(self.st.left));
+
+        std::fs::rename(&cmp_info.merged_log_path, &new_name).unwrap();
+
+        Ok(())
+    }
+
+    fn process_cmd(&mut self, req: Request) -> Result<()> {
+        let (cmd, reply_ch) = req;
+        let reply = match cmd {
+            Cmd::Get(key) => Reply::Get(self.get(key)?),
+            Cmd::Set(key, value) => Reply::Set(self.set(key, value).is_ok()),
+            Cmd::Remove(key) => Reply::Remove(self.remove(key)?),
+            _ => panic!("unsupported cmds"),
+        };
+        reply_ch.send(reply)?;
+        Ok(())
+    }
+
+    fn delete_stale_log(&mut self, mut dir_path: PathBuf, left: u32, last: u32) -> Result<()> {
+        for fid in left..=last {
+            dir_path.push(StableStorage::data_file_name(fid));
+            std::fs::remove_file(&dir_path)?;
+            debug!("delete stale file: {:?}", &dir_path);
+            dir_path.pop();
+        }
+        Ok(())
+    }
+
+    fn compress(
+        cmp_recvr: Receiver<CompressInfo>,
+        done_sender: SyncSender<CompressInfo>,
+    ) -> Result<()> {
+        info!("compressor up");
+        let mut quit = false;
+        loop {
+            if let Ok(cmp_info) = cmp_recvr.recv() {
+                info!("compressing [{}-{}]", cmp_info.left, cmp_info.right - 2);
+                let cmp = Compressor::new(cmp_info);
+                match cmp.log_compress() {
+                    Err(e) => panic!(e),
+                    Ok(cmp_info) => {
+                        done_sender.send(cmp_info).unwrap();
+                    }
+                }
+            } else {
+                quit = true;
+            }
+            if quit {
+                break;
+            }
+        }
+        info!("compressor down");
+        Ok(())
+    }
 }
 
 /// Builder for KVStore.
@@ -159,7 +416,7 @@ impl KvStoreBuilder {
     pub fn new() -> KvStoreBuilder {
         KvStoreBuilder {
             path: None,
-            fsz_th: 512,
+            fsz_th: 512 * KB as u32,
             enable_compress: true,
         }
     }
@@ -183,16 +440,16 @@ impl KvStoreBuilder {
     }
 
     /// Build
-    pub fn build(&mut self) -> Result<KvStore> {
+    pub fn build(&mut self) -> Result<(KvAdaptor, KvStore)> {
         let p: PathBuf = if let Some(ref path) = self.path {
             Path::new(path).to_path_buf()
         } else {
             [".", "stab"].iter().collect::<PathBuf>()
         };
-        let mut kvs = KvStore::open(p)?;
+        let (kva, mut kvs) = KvStore::open(p)?;
         kvs.set_data_threshold(self.fsz_th);
         kvs.st.enable_log_compress = self.enable_compress;
-        Ok(kvs)
+        Ok((kva, kvs))
     }
 }
 
@@ -201,9 +458,12 @@ struct MemDirEntry {
     fid: u32,
     offset: u32,
     sz: u32,
-    // vsz: u32,
-    // val_pos: u32,
-    // timestamp.
+}
+
+impl MemDirEntry {
+    fn plain(&self) -> (u32, u32, u32) {
+        (self.fid, self.offset, self.sz)
+    }
 }
 
 impl Default for MemDirEntry {
@@ -216,7 +476,7 @@ impl Default for MemDirEntry {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct KeyDir {
     map: HashMap<Key, MemDirEntry>,
 }
@@ -235,18 +495,20 @@ impl KeyDir {
     }
 
     #[inline]
-    /// Update diretory entry.
-    fn update(&mut self, k: &Key, fid: u32, offset: u32, sz: u32) -> Result<()> {
+    /// Update diretory entry and return size of stale kv entry.
+    fn update(&mut self, k: &Key, fid: u32, offset: u32, sz: u32) -> Result<u32> {
         let e = self.map.entry(k.clone()).or_insert(MemDirEntry::default());
+        let stale_sz = e.sz;
         e.fid = fid;
         e.offset = offset;
         e.sz = sz;
-        Ok(())
+        Ok(stale_sz)
     }
 
+    /// return size (in Byte) of stale kv entry.
     #[inline]
-    fn remove(&mut self, k: &Key) {
-        let _ = self.map.remove(k);
+    fn remove(&mut self, k: &Key) -> u32 {
+        self.map.remove(k).map_or(0, |e| e.sz)
     }
 }
 
@@ -268,7 +530,6 @@ enum StableEntryState {
 }
 
 const PATH_FID_LIST: &str = "fids";
-
 struct StableStorage {
     // [left, right)
     // right-1 is the number of the active file.
@@ -279,18 +540,24 @@ struct StableStorage {
     fsz_th: u32,
 
     // Bufferd reader
+    // readers: BTreeMap<u32, BufReader<File>>,
     readers: BTreeMap<u32, BufReader<File>>,
 
     active_f: Option<BufWriter<File>>,
-    // = len(file), Bytes.
-    total_bs: u32,
 
-    // dir_path
+    // = len(file), Bytes.
+    last_file_size: u32,
+
+    // Path of directory storing log files.
     dir_path: PathBuf,
-    // path.
+
+    // total path of active log file.
     active_path: PathBuf,
 
     enable_log_compress: bool,
+
+    // statistic about data.
+    stat: Stat,
 }
 
 impl StableStorage {
@@ -301,41 +568,26 @@ impl StableStorage {
             fsz_th: 4096,
             readers: BTreeMap::new(),
             active_f: None,
-            total_bs: 0,
+            last_file_size: 0,
             dir_path: PathBuf::new(),
             active_path: PathBuf::new(),
             enable_log_compress: true,
+            stat: Stat::new(DEFAULT_DUP_PROP, DEFAULT_DUP_MIN_TH),
         }
     }
 
-    /// TODO: Consider log compaction.
+    fn last_file_size(&self) -> u32 {
+        self.last_file_size
+    }
+
     /// Return Error if there is no such key.
     fn load(&mut self, fid: u32, offset: u32, sz: u32) -> Result<StableEntry> {
-        /* =====================================================================
-        ref: https://github.com/Tsumida/rskvs/issues/2
-            offset
-            |
-            | obj_size: u32 | json_string |
-        =====================================================================*/
-        let mut buf = vec![0; sz as usize];
-
-        assert!(self.left <= fid && fid < self.right);
-
-        let reader = self.readers.get_mut(&fid).unwrap();
-        reader.seek(SeekFrom::Start(offset as u64))?;
-        let obj_size = reader.read_u32::<NativeEndian>().unwrap();
-
-        assert_eq!(obj_size, sz);
-        reader.read_exact(&mut buf).unwrap();
-
-        // deserilization.
-        let se = serde_json::from_slice::<StableEntry>(&buf).unwrap();
-        assert_eq!(&StableEntryState::Valid, &se.st);
-        Ok(se)
+        StableStorage::load_raw(self.readers.get_mut(&fid).unwrap(), fid, offset, sz)
+            .and_then(|buf| Ok(serde_json::from_slice::<StableEntry>(&buf).unwrap()))
     }
 
     /// Load raw bytes without deserializaion.
-    fn load_raw(&mut self, fid: u32, offset: u32, sz: u32) -> Result<Vec<u8>> {
+    fn load_raw(reader: &mut BufReader<File>, fid: u32, offset: u32, sz: u32) -> Result<Vec<u8>> {
         /* =====================================================================
         ref: https://github.com/Tsumida/rskvs/issues/2
             offset
@@ -343,8 +595,8 @@ impl StableStorage {
             | obj_size: u32 | json_string |
         =====================================================================*/
         let mut buf = vec![0; sz as usize];
-        assert!(self.left <= fid && fid < self.right);
-        let reader = self.readers.get_mut(&fid).unwrap();
+
+        //let reader = self.readers.get_mut(&fid).unwrap();
         reader.seek(SeekFrom::Start(offset as u64))?;
         let obj_size = reader.read_u32::<NativeEndian>().unwrap();
 
@@ -358,21 +610,16 @@ impl StableStorage {
     /// Append key-value pair to active file. Return file id, offset and pair size.
     fn stablize(
         &mut self,
-        kd: &mut KeyDir,
         k: Key,
         v: Value,
         st: StableEntryState,
+        stale_sz: u32,
     ) -> Result<(u32, u32, u32)> {
         let se = StableEntry {
             st: st,
             key: k,
             val: v,
         };
-
-        if self.right - self.left >= 5 && self.enable_log_compress {
-            self.log_compress(kd, self.left, self.right)?; // self.left changed.
-            self.rebuild_readers(self.left, self.right)?;
-        }
 
         if self.active_f.is_none() || self.reach_threshold() {
             self.create_new_active_file()?;
@@ -381,17 +628,21 @@ impl StableStorage {
         if !self.readers.contains_key(&self.active_fid()) {
             self.insert_new_reader(self.active_fid())?;
         }
-
+        // binary format:  | len(json(se)) |        json(se)        |
+        //                 | len(json(se)) | state |  key  |  val   |
         let f = self.active_f.as_mut().unwrap().get_mut();
         let s = serde_json::to_string(&se)?;
         let size = s.as_bytes().len() as u32;
-        let offset = self.total_bs;
-        self.total_bs = StableStorage::store(f, offset, s.as_bytes())?;
+        let offset = self.last_file_size;
+        self.last_file_size = StableStorage::store(f, offset, s.as_bytes())?;
+
+        self.stat.increase_dup_size(stale_sz as u64);
 
         Ok((self.active_fid(), offset, size)) // offset and length
     }
 
     /// Store.
+    /// bin format: | len(s) | s |
     #[inline]
     fn store(mut f: impl Write, mut total_bs: u32, s: &[u8]) -> Result<u32> {
         let size = s.len() as u32;
@@ -405,7 +656,7 @@ impl StableStorage {
 
     #[inline]
     fn reach_threshold(&self) -> bool {
-        self.total_bs >= self.fsz_th
+        self.last_file_size >= self.fsz_th
     }
 
     #[inline]
@@ -427,15 +678,14 @@ impl StableStorage {
     }
 
     /// 1. left==None
-    fn update_fid_list(&mut self, left: u32, right: u32) -> Result<()> {
+    fn update_fid_list(mut dir_path: PathBuf, left: u32, right: u32) -> Result<()> {
         // | st: u32 | end: u32 |  -->  [st, end)
-        let mut p = self.dir_path.clone();
-        p.push(PATH_FID_LIST);
+        dir_path.push(PATH_FID_LIST);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(&p)?;
+            .open(&dir_path)?;
 
         f.write_u32::<NativeEndian>(left)?;
         f.write_u32::<NativeEndian>(right)?;
@@ -446,7 +696,7 @@ impl StableStorage {
     fn create_new_active_file(&mut self) -> Result<()> {
         self.right += 1;
         //eprintln!("create active file -- {}", self.active_fid());
-        self.update_fid_list(self.left, self.right)?; // record this new fid.
+        StableStorage::update_fid_list(self.dir_path.clone(), self.left, self.right)?; // record this new fid.
 
         self.active_path = self.dir_path.clone();
         self.active_path
@@ -456,9 +706,9 @@ impl StableStorage {
             .append(true)
             .open(&self.active_path)?;
 
-        self.total_bs = f.metadata().unwrap().len() as u32;
-        //self.total_bs = 0;
-        //eprintln!("active file size: {}", self.total_bs);
+        self.last_file_size = f.metadata().unwrap().len() as u32;
+        //self.last_file_size = 0;
+        //eprintln!("active file size: {}", self.last_file_size);
         self.active_f = Some(BufWriter::new(f));
         Ok(())
     }
@@ -466,35 +716,23 @@ impl StableStorage {
     /// Rebuild KeyDir before KVStorage is available for user.
     fn rebuild_from_all(&mut self) -> Result<KeyDir> {
         let mut kd = KeyDir::new();
-        let mut dir_path = self.dir_path.clone();
+        let dir_path = self.dir_path.clone();
 
         // check existance of fids.
         let mut fid_path = dir_path.clone();
         fid_path.push(PATH_FID_LIST);
         if !fid_path.exists() {
-            self.update_fid_list(1, 1).unwrap();
+            StableStorage::update_fid_list(self.dir_path.clone(), 1, 1).unwrap();
         }
 
         // read fids from PATH_FID_LIST
         let mut bf = BufReader::new(std::fs::OpenOptions::new().read(true).open(fid_path)?);
 
-        // update [left, right)
-        match bf.read_u32::<NativeEndian>() {
-            Ok(st) => {
-                bf.seek(SeekFrom::Start(4)).unwrap();
-                self.left = st;
-                self.right = bf.read_u32::<NativeEndian>().unwrap();
-            }
-            _ => {}
-        }
+        self.update_interval(&mut bf);
 
         // read all data files.
-        for fid in self.left..self.right {
-            dir_path.push(StableStorage::data_file_name(fid));
-            self.total_bs = StableStorage::rebuild_from_single(&mut kd, &dir_path, fid)?;
-            dir_path.pop();
-            self.insert_new_reader(fid)?;
-        }
+        self.rebuild_all(&mut kd, dir_path)?;
+
         if self.right > self.left {
             if !self.reach_threshold() {
                 self.right -= 1
@@ -503,6 +741,28 @@ impl StableStorage {
         }
 
         Ok(kd)
+    }
+
+    fn rebuild_all(&mut self, kd: &mut KeyDir, mut dir_path: PathBuf) -> Result<()> {
+        for fid in self.left..self.right {
+            dir_path.push(StableStorage::data_file_name(fid));
+            self.last_file_size = StableStorage::rebuild_from_single(kd, &dir_path, fid)?;
+            dir_path.pop();
+            self.insert_new_reader(fid)?;
+        }
+        Ok(())
+    }
+
+    // update [left, right)
+    fn update_interval(&mut self, bf: &mut BufReader<File>) {
+        match bf.read_u32::<NativeEndian>() {
+            Ok(st) => {
+                bf.seek(SeekFrom::Start(4)).unwrap();
+                self.left = st;
+                self.right = bf.read_u32::<NativeEndian>().unwrap();
+            }
+            _ => {}
+        }
     }
 
     /// Rebuild a signle data file.
@@ -545,60 +805,107 @@ impl StableStorage {
         Ok(())
     }
 
-    /// Take log entires in [left, right), moving them into file numbered right - 1.
-    fn log_compress(&mut self, kd: &mut KeyDir, left: u32, right: u32) -> Result<()> {
-        assert!(right > left);
-
-        let mut merged_path = self.dir_path.clone();
-        let mut tmp = self.dir_path.clone();
-        let fid = right - 1;
-
-        merged_path.push(format!("{}.mege", fid));
-        // moving log entries...
-        {
-            let mut bf = BufWriter::new(File::create(&merged_path)?);
-            let mut meta = Vec::new();
-            // kd -> meta
-            for (k, v) in kd.map.iter() {
-                meta.push((k.clone(), v.clone()));
-            }
-            let mut total_bs = 0;
-
-            // moving ..
-            for (k, v) in &meta {
-                let buf = self.load_raw(v.fid, v.offset, v.sz).unwrap();
-                bf.write_u32::<NativeEndian>(v.sz).unwrap();
-                let obj_sz = bf.write(&buf).unwrap() as u32;
-                kd.update(k, fid, total_bs, obj_sz).unwrap();
-
-                assert_eq!(obj_sz, v.sz);
-                total_bs += obj_sz + 4;
-            }
-            self.total_bs = total_bs as u32;
-        } // bf drop here.
+    fn clean_old_files(&mut self, left: u32, right: u32, tmp_path: &mut PathBuf) {
         for id in left..right {
-            tmp.push(StableStorage::data_file_name(id));
-            std::fs::remove_file(&tmp).unwrap();
+            tmp_path.push(StableStorage::data_file_name(id));
+            std::fs::remove_file(&tmp_path).unwrap();
             self.readers.remove(&id);
-            tmp.pop();
+            tmp_path.pop();
         }
-        // rename.
-        tmp.push(StableStorage::data_file_name(fid));
-        std::fs::rename(&merged_path, &tmp).unwrap();
-        // generate hint file.
+    }
+}
 
-        // update fid_list
-        // |    compressed     |
-        // |left,        right - 1, right,  ... act_fid |
-        //      |        right - 1  ........... act_fid |
-        //      |                                  |
-        //  self.left ----------------------- self.right
-        self.left = right - 1;
-        self.active_path = self.dir_path.clone();
-        self.update_fid_list(self.left, self.right).unwrap();
-        self.active_path
-            .push(StableStorage::data_file_name(self.active_fid()));
+struct Compressor {
+    left: u32,
+    right: u32,
+    dir_path: PathBuf,
+    readers: BTreeMap<u32, BufReader<File>>,
+    merged_path: PathBuf,
+    merged_file: BufWriter<File>,
+    kd: KeyDir,
+    stat: Stat,
+}
 
-        Ok(())
+impl Compressor {
+    /// Take log entires in [left, right), moving them into file numbered right - 1.
+    fn log_compress(mut self) -> Result<CompressInfo> {
+        let merged_fid = self.right - 2;
+        self.merge_stale_log(merged_fid)?;
+        // [merged_fid, right)
+        let cmp_info = CompressInfo {
+            // left: merged_fid,
+            left: self.left,
+            right: self.right,
+            stat: self.stat.clone(),
+            dir_path: self.dir_path,
+            merged_log_path: self.merged_path,
+            kd: self.kd,
+        };
+
+        Ok(cmp_info)
+    }
+
+    fn merge_stale_log(&mut self, merged_fid: u32) -> Result<u32> {
+        let mut new_log = &mut self.merged_file;
+        let last = self.right - 2;
+        // size of merged file.
+        let mut total_bs = 0;
+
+        let kd = &mut self.kd;
+        // move all entry in kd to new log file.
+        for (k, v) in kd.map.iter_mut() {
+            if v.fid < self.left {
+                panic!("invalid fid"); // log is copressed and deleted.
+            }
+            if v.fid > last {
+                // kv pair in active file.
+                continue;
+            }
+            let buf = StableStorage::load_raw(
+                self.readers.get_mut(&v.fid).unwrap(),
+                v.fid,
+                v.offset,
+                v.sz,
+            )?;
+            let obj_sz = buf.len() as u32;
+            StableStorage::store(&mut new_log, total_bs, &buf)?;
+
+            v.fid = merged_fid;
+            v.offset = total_bs;
+            v.sz = obj_sz;
+
+            assert_eq!(obj_sz, v.sz);
+            total_bs += obj_sz + 4;
+        }
+        debug!("merged log size: {} bytes", total_bs);
+        Ok(total_bs as u32)
+    }
+
+    fn new(cmp_info: CompressInfo) -> Self {
+        let mut readers = BTreeMap::new();
+        let mut dir_path = cmp_info.dir_path.clone();
+        let (left, right) = (cmp_info.left, cmp_info.right);
+
+        for fid in left..right - 1 {
+            dir_path.push(StableStorage::data_file_name(fid));
+            let bfr = BufReader::new(std::fs::File::open(&dir_path).unwrap());
+            readers.insert(fid, bfr);
+            dir_path.pop();
+        }
+
+        let mut merged_path = dir_path.clone();
+        // active file excluded.
+        merged_path.push(format!("{}.mege", right - 2));
+        let bfw = BufWriter::new(std::fs::File::create(&merged_path).unwrap());
+        Compressor {
+            left: cmp_info.left,
+            right: cmp_info.right,
+            dir_path: cmp_info.dir_path,
+            readers,
+            merged_path,
+            merged_file: bfw,
+            kd: cmp_info.kd,
+            stat: cmp_info.stat,
+        }
     }
 }

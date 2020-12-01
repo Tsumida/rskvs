@@ -5,8 +5,10 @@ extern crate clap;
 use clap::App;
 use tempfile::TempDir;
 
-use rskvs::KvStoreBuilder;
+use simplelog::*;
 
+use rskvs::{Cmd, KvStoreBuilder};
+/*
 fn test_case(size: usize) -> Vec<(String, String)> {
     (0..size)
         .map(|i| {
@@ -81,9 +83,43 @@ fn bench_write_no_compression(v: &Vec<(String, String)>) -> usize {
     }
     let dur = SystemTime::now().duration_since(st).unwrap().as_millis();
     dur as usize
-}
+}*/
 
 fn main() {
+    CombinedLogger::init(vec![TermLogger::new(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+    )])
+    .unwrap();
+    let (kva, mut kvs) = rskvs::KvStoreBuilder::new()
+        .set_data_threshold(4 << 10)
+        .build()
+        .unwrap();
+    let h1 = std::thread::spawn(move || {
+        kvs.run();
+        kvs.init_state();
+    });
+
+    let kv_pairs = (0..100)
+        .map(|_| random_kv())
+        .collect::<Vec<(String, String)>>();
+
+    for i in 0..10 {
+        for (key, val) in &kv_pairs {
+            let (s, r) = std::sync::mpsc::sync_channel(1);
+            kva.op_sender
+                .send((Cmd::Set(key.clone(), val.clone()), s))
+                .unwrap();
+            r.recv().unwrap();
+        }
+        //std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    drop(kva);
+    h1.join().unwrap();
+}
+
+fn cli() {
     let yaml = load_yaml!("cli_kvs.yml"); // static checking.
     let matc = App::from_yaml(&yaml).get_matches();
     let mut bd = KvStoreBuilder::new();
@@ -91,74 +127,17 @@ fn main() {
         bd.set_dir_path(path);
     }
 
-    let mut kvs = bd.set_data_threshold(512).build().unwrap();
+    let (_, mut kvs) = bd.set_data_threshold(512).build().unwrap();
     kvs.init_state();
+}
 
-    match matc.subcommand() {
-        ("bench", Some(sub_set)) => {
-            let size = 20000;
-            eprintln!("case size = {}", size);
-            let v = test_case(size);
-            let random_index = (0..size)
-                .map(|i| rand::random::<usize>() % size)
-                .collect::<Vec<usize>>();
-            if sub_set.is_present("WRITE_NO_COMPRESSION") {
-                eprintln!("testing writing without compression...");
-                eprintln!("take: {} ms", bench_write_no_compression(&v));
-            }
-
-            if sub_set.is_present("WRITE") {
-                eprintln!("testing writing with compression...");
-                eprintln!("take: {} ms", bench_write(&v));
-            }
-
-            if sub_set.is_present("READ") {
-                eprintln!("testing reading...");
-                eprintln!("take: {} ms", bench_read(&v, &random_index));
-            }
-
-            std::process::exit(0);
-        }
-        ("set", Some(sub_set)) => {
-            let key = sub_set.value_of("KEY").unwrap_or("");
-            let val = sub_set.value_of("VALUE").unwrap_or("");
-            if let Err(e) = kvs.set(key.to_string(), val.to_string()) {
-                println!("--{}", e);
-                std::process::exit(-1);
-            }
-            std::process::exit(0);
-        }
-        ("get", Some(sub_get)) => {
-            let key = sub_get.value_of("KEY").unwrap_or("");
-            match kvs.get(key.to_string()) {
-                Ok(sv) => {
-                    match sv {
-                        None => println!("Key not found"),
-                        Some(v) => println!("{}", v),
-                    }
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    println!("{}", e);
-                    std::process::exit(-1);
-                }
-            }
-        }
-        ("rm", Some(sub_rm)) => {
-            let key = sub_rm.value_of("KEY").unwrap_or("");
-            match kvs.remove(key.to_string()) {
-                Ok(r) => {
-                    if !r {
-                        println!("Key not found");
-                        std::process::exit(-1);
-                    }
-                    std::process::exit(0);
-                }
-                Err(_) => std::process::exit(-1),
-            }
-        }
-        _ => {
-            std::process::exit(-1);
-        }
+fn random_kv() -> (String, String) {
+    let n = 4;
+    let k = (rand::random::<usize>() % (1 << 30)).to_string();
+    let mut v = String::with_capacity(n * k.len());
+    for _ in 0..n {
+        v.extend(k.lines());
     }
+
+    (k, v)
 }
